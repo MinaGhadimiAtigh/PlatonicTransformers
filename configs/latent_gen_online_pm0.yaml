@@ -1,0 +1,123 @@
+# ONLINE latent flow matching: the frozen PlatonicSplats autoencoder encodes every training scene from
+# RANDOM input views at every step (no saved latents). Model / flow objective / samplers are those of
+# configs/latent_gen.yaml (and so of qm9_gen.yaml); only the data side differs.
+#
+# Runs in the PlatonicSplats environment (the autoencoder needs it), see the header of
+# mains/main_latent_gen_FM_online.py for the exact command.
+
+seed: 42
+
+dataset:
+  name: "latents_online"
+  psplat_repo: null          # REQUIRED: the PlatonicSplats checkout (holds scripts/visualization/render_scene_video.py)
+  ae_run: null               # REQUIRED: the autoencoder run folder (config.yaml + ckpt_*.pt)
+  ae_ckpt: null              # optional: a specific checkpoint inside ae_run (default: the latest)
+  data_root: null            # REQUIRED: dataset ROOT (holds train/ and val/)
+  n_input_views: null        # views per encoding; null = the autoencoder's training.num_input_views (5)
+  sort_views: false          # false = random order (as the autoencoder's own training sampler gives them)
+  val_views: null            # fixed views for the val/copy-check latents; null = 0..n_input_views-1
+  repeats_per_epoch: 1       # each train scene appears this many times per epoch (each with new views)
+  norm_passes: 2             # random-view passes over the train set used (with the fixed-view pass) for
+                             # the normalisation statistics
+  encoder_amp: false         # true: encode under bf16 autocast (faster; latents differ slightly from fp32)
+  selftest: true             # check view control / determinism / frame consistency before training
+  dataset_fraction: 1.0
+
+# Model: the QM9-gen PlatonicTransformer, with input/output widths set from the latent feature size.
+#
+# WIDTH NOTE: each latent feature is an invariant SCALAR, and the Platonic lift copies all scalars into
+# every group frame, so they enter through hidden_dim / |G| channels per frame. Keep hidden_dim / |G| at
+# least the feature size: e.g. 384 features -> trivial: hidden_dim >= 384; octahedron (|G|=24) would
+# need >= 9216, which is why an equivariant setup should come with an equivariant AUTOENCODER, whose
+# invariant latent is only d/|G| wide (384 / 12 = 32 for a tetrahedral one).
+model:
+  name: "platoformer"
+  hidden_dim: 768
+  num_layers: 8
+  num_heads: 12              # must be divisible by |G| (trivial: any; tetrahedron 12; octahedron 24)
+  solid_name: "trivial"      # trivial | tetrahedron | octahedron | icosahedron. Match the autoencoder:
+                             # a `trivial` autoencoder's latents are tied to the scene frame.
+  spatial_dim: 3
+  dense_mode: true           # every scene has the same 256 tokens -> dense attention (SDPA)
+  scalar_task_level: "node"
+  vector_task_level: "node"
+  ffn_readout: true
+  mean_aggregation: false
+  attention: true
+  dropout: 0.0
+  drop_path_rate: 0.0
+  layer_scale_init_value: null
+  ffn_dim_factor: 4
+  rope_sigma: 4.0            # positions are standardised to unit std (QM9 uses 4.0 on Angstrom coords)
+  ape_sigma: null
+  learned_freqs: true
+  freq_init: "spiral"
+  use_key: false
+  rope_on_values: true
+  compile: false             # QM9 uses true; off by default here to keep first runs simple
+  attention_backend: "scatter"   # only used when dense_mode is false
+
+# Flow matching: same knobs as qm9_gen.yaml (EDM-preconditioned velocity, SNR-matched time schedule).
+diffusion:
+  sigma_data: 1.0            # features and positions are standardised to unit std
+  P_mean: 0.0
+  P_std: 1.2
+  avg_num_nodes: 256.0
+  pos_mode: "joint"          # joint = generate positions AND features (default) | given = generate only
+                             # FEATURES for real token positions (a diagnostic: can the model place the
+                             # right features at known positions? sampling takes positions from training scenes)
+  sampler: "fm"              # "fm" = plain ODE from pure noise (t=0) | "edm" = Karras/Heun with churn
+  num_steps: 50
+  fm_t_start: 0.0
+  fm_integrator: "heun"
+  sigma_min: 0.002           # edm sampler only
+  sigma_max: 1.0
+  rho: 7.0
+  S_churn: 0.0
+
+training:
+  epochs: 2000               # 512 scenes / batch 32 = 16 steps per epoch -> 32k steps (each with new views)
+  batch_size: 32
+  gradient_clip_val: 0.5
+  augm: "none"               # none | yaw | so3. Rotations are only valid for an EQUIVARIANT autoencoder
+                             # (yaw = about augm_axis, for gravity scenes; so3 for free scenes)
+  augm_axis: 2               # lvsm_mean frame: the vertical is the z axis for a gravity rig
+  validation_frequency: 100  # sample + copying check + token-size check + a KEPT checkpoint every N epochs
+  keep_all_ckpts: true       # keep every periodic checkpoint (~0.9 GB each with optimiser + EMA state, so
+                             # ~18 GB for 2000 epochs); false = keep only the newest, as in the offline run
+  check_val_every_n_epoch: 10
+  num_val_samples: 16
+  num_render: 4              # at every sample check, render this many generated scenes with the frozen
+                             # decoder -> <output_dir>/renders/epochNNNNN.png (0 = off)
+  render_views: 6            # camera views per rendered row (from the first val scene's rig)
+  ema_enabled: true
+  ema_decay: 0.999
+  ema_warmup_steps: 2000
+  val_repeats: 4             # val loss = mean over this many (t, noise) draws, with a FIXED seed, so val
+                             # curves move only when the model changes, not because of sampling noise
+
+optimizer:
+  name: "adamw"
+  lr: 2.0e-4
+  weight_decay: 1.0e-6
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 0
+  use_cosine: true
+
+logging:
+  enabled: false
+  project_name: "Platonic-Latent-Gen"
+  wandb_identity: null
+
+system:
+  gpus: 1
+  num_workers: 6            # image loading happens in workers; the encoding on the GPU
+  precision: "32"
+
+testing:
+  test_ckpt: null            # set to a checkpoint to only SAMPLE (writes samples.npz)
+  resume_ckpt: null
+  num_samples: 64            # scenes to generate in test/sampling mode
+  output_dir: "runs/latent_gen_online_pm0"

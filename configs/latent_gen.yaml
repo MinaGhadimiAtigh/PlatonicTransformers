@@ -1,0 +1,102 @@
+# Flow matching on PlatonicSplats autoencoder LATENTS (one scene = a set of positioned latent tokens).
+# Same model / flow objective / samplers as configs/qm9_gen.yaml + mains/main_qm9_gen_FM.py; only the
+# data side differs. Latents come from PlatonicSplats scripts/latent_fm/extract_latents.py.
+#
+#   python mains/main_latent_gen_FM.py --config configs/latent_gen.yaml \
+#       --dataset.latents_dir=/media/mina/hdd/amlab/nvsm/latents/ae_grav_trivial
+
+seed: 42
+
+dataset:
+  name: "latents"
+  latents_dir: null          # REQUIRED: extract_latents.py --out folder (holds train/ val/ meta.json)
+  dataset_fraction: 1.0      # downsample the training scenes for debugging
+
+# Model: the QM9-gen PlatonicTransformer, with input/output widths set from the latent feature size.
+#
+# WIDTH NOTE: each latent feature is an invariant SCALAR, and the Platonic lift copies all scalars into
+# every group frame, so they enter through hidden_dim / |G| channels per frame. Keep hidden_dim / |G| at
+# least the feature size: e.g. 384 features -> trivial: hidden_dim >= 384; octahedron (|G|=24) would
+# need >= 9216, which is why an equivariant setup should come with an equivariant AUTOENCODER, whose
+# invariant latent is only d/|G| wide (384 / 12 = 32 for a tetrahedral one).
+model:
+  name: "platoformer"
+  hidden_dim: 768
+  num_layers: 8
+  num_heads: 12              # must be divisible by |G| (trivial: any; tetrahedron 12; octahedron 24)
+  solid_name: "trivial"      # trivial | tetrahedron | octahedron | icosahedron. Match the autoencoder:
+                             # a `trivial` autoencoder's latents are tied to the scene frame.
+  spatial_dim: 3
+  dense_mode: true           # every scene has the same 256 tokens -> dense attention (SDPA)
+  scalar_task_level: "node"
+  vector_task_level: "node"
+  ffn_readout: true
+  mean_aggregation: false
+  attention: true
+  dropout: 0.0
+  drop_path_rate: 0.0
+  layer_scale_init_value: null
+  ffn_dim_factor: 4
+  rope_sigma: 4.0            # positions are standardised to unit std (QM9 uses 4.0 on Angstrom coords)
+  ape_sigma: null
+  learned_freqs: true
+  freq_init: "spiral"
+  use_key: false
+  rope_on_values: true
+  compile: false             # QM9 uses true; off by default here to keep first runs simple
+  attention_backend: "scatter"   # only used when dense_mode is false
+
+# Flow matching: same knobs as qm9_gen.yaml (EDM-preconditioned velocity, SNR-matched time schedule).
+diffusion:
+  sigma_data: 1.0            # features and positions are standardised to unit std
+  P_mean: -1.2
+  P_std: 1.2
+  avg_num_nodes: 256.0
+  sampler: "fm"              # "fm" = plain ODE from pure noise (t=0) | "edm" = Karras/Heun with churn
+  num_steps: 50
+  fm_t_start: 0.0
+  fm_integrator: "heun"
+  sigma_min: 0.002           # edm sampler only
+  sigma_max: 1.0
+  rho: 7.0
+  S_churn: 0.0
+
+training:
+  epochs: 2000               # 512 scenes / batch 32 = 16 steps per epoch -> 32k steps
+  batch_size: 32
+  gradient_clip_val: 0.5
+  augm: "none"               # none | yaw | so3. Rotations are only valid for an EQUIVARIANT autoencoder
+                             # (yaw = about augm_axis, for gravity scenes; so3 for free scenes)
+  augm_axis: 2               # lvsm_mean frame: the vertical is the z axis for a gravity rig
+  validation_frequency: 100  # sample + copying check every N epochs
+  check_val_every_n_epoch: 10
+  num_val_samples: 16
+  ema_enabled: true
+  ema_decay: 0.999
+  ema_warmup_steps: 2000
+
+optimizer:
+  name: "adamw"
+  lr: 2.0e-4
+  weight_decay: 1.0e-6
+
+scheduler:
+  name: "cosine"
+  warmup_epochs: 0
+  use_cosine: true
+
+logging:
+  enabled: false
+  project_name: "Platonic-Latent-Gen"
+  wandb_identity: null
+
+system:
+  gpus: 1
+  num_workers: 0
+  precision: "32"
+
+testing:
+  test_ckpt: null            # set to a checkpoint to only SAMPLE (writes samples.npz)
+  resume_ckpt: null
+  num_samples: 64            # scenes to generate in test/sampling mode
+  output_dir: "runs/latent_gen"

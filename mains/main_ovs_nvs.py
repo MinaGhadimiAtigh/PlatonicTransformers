@@ -175,7 +175,16 @@ class PlatonicNVS(nn.Module):
             spatial_dim=3, dense_mode=True, scalar_task_level="node", vector_task_level="node",
             ffn_readout=True, attention=True, dropout=0.0, drop_path_rate=args.drop_path,
             rope_sigma=args.rope_sigma, learned_freqs=True, freq_init="spiral", rope_on_values=True,
+            qk_norm=args.qk_norm,
         )
+        # Zero-init the last readout layer (as in DiT): the model starts by predicting 0 (= grey in
+        # regression, zero velocity in flow) instead of a large random offset, and the residual stream
+        # is free to differentiate tokens before the head commits to anything.
+        last = self.net.scalar_readout[-1] if isinstance(self.net.scalar_readout, nn.Sequential) \
+            else self.net.scalar_readout
+        nn.init.zeros_(last.kernel)
+        if getattr(last, "bias", None) is not None:
+            nn.init.zeros_(last.bias)
         if args.compile:
             self.net = torch.compile(self.net)
 
@@ -204,6 +213,8 @@ def regression_loss(model, batch):
     tgt = patchify(batch["image"][:, a.num_context:], model.p) * 2 - 1
     B = tgt.shape[0]
     pred = model(batch, torch.zeros_like(tgt), torch.zeros(B, 1, device=tgt.device))
+    if a.bounded_output:  # tanh keeps pixels in [-1,1], like LVSM's sigmoid keeps them in [0,1]
+        pred = torch.tanh(pred)
     return F.mse_loss(pred, tgt), pred
 
 
@@ -280,7 +291,7 @@ def to_device(batch, device):
 @torch.no_grad()
 def evaluate(model, loader, device, amp, max_batches=None, save_grid=None):
     model.eval()
-    scores, first = [], None
+    scores, base, first = [], [], None
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
@@ -289,12 +300,17 @@ def evaluate(model, loader, device, amp, max_batches=None, save_grid=None):
             pred = render(model, batch)
         gt = batch["image"][:, model.args.num_context:]
         scores.append(psnr(pred.float(), gt))
+        # reference: just averaging the context images (a model must beat this to have learned anything)
+        ctx_mean = batch["image"][:, : model.args.num_context].mean(1, keepdim=True).expand_as(gt)
+        base.append(psnr(ctx_mean, gt))
         if first is None:
             first = (batch["image"], pred)
     if save_grid and first is not None:
         save_sample_grid(*first, model.args.num_context, save_grid)
     model.train()
-    return float(np.mean(scores)) if scores else float("nan")
+    if not scores:
+        return float("nan"), float("nan")
+    return float(np.mean(scores)), float(np.mean(base))
 
 
 def save_sample_grid(images, pred, nc, path, max_rows=4):
@@ -342,6 +358,13 @@ def main():
     hw = train_ds.hw
     if hw[0] % a.patch_size or hw[1] % a.patch_size:
         raise ValueError(f"image size {hw} not divisible by patch_size {a.patch_size}")
+    if a.rope_sigma <= 0:
+        # auto: neighbouring patches sit ~patch/focal apart (in units of the camera-centre distance,
+        # which the dataset normalises to 1). Make the highest RoPE frequency resolve that spacing,
+        # otherwise attention cannot tell adjacent target patches apart and predicts one mean colour.
+        fx = float(train_ds.K[:, 0].mean())
+        a.rope_sigma = fx / a.patch_size
+        print(f"rope_sigma auto -> {a.rope_sigma:.1f} (focal {fx:.1f}px / patch {a.patch_size}px)")
     model = PlatonicNVS(a, hw).to(device)
     n_tok = (a.num_context + a.num_target) * (hw[0] // a.patch_size) * (hw[1] // a.patch_size)
     print(f"{len(train_ds)} train scenes, {len(val_loader.dataset)} val scenes | image {hw} | "
@@ -360,33 +383,48 @@ def main():
         print(f"loaded {a.ckpt} (step {ck.get('step')})")
 
     if a.eval_only:
-        score = evaluate(model, val_loader, device, amp, save_grid=out / "eval_samples.png")
-        print(json.dumps({"val_psnr": score, "rot_eval": a.rot_eval}))
+        score, base = evaluate(model, val_loader, device, amp, save_grid=out / "eval_samples.png")
+        print(json.dumps({"val_psnr": score, "baseline_psnr": base, "rot_eval": a.rot_eval}))
         return
 
     loss_fn = flow_loss if a.mode == "flow" else regression_loss
     log = open(out / "metrics.jsonl", "a")
     model.train()
     t0, running = time.time(), []
+    loss_ema, skipped, gnorm = None, 0, torch.tensor(0.0)
     while step < a.steps:
         for batch in train_loader:
             batch = to_device(batch, device)
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
                 loss, _ = loss_fn(model, batch)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
-            opt.step(); sched.step(); step += 1
-            running.append(loss.item())
+            lv = loss.item()
+            # Spike guard: a batch whose loss is far above the recent typical value (or not finite)
+            # is skipped instead of being allowed to wreck the weights. Logged, with its scenes.
+            spike = (not math.isfinite(lv)) or (loss_ema is not None and step > a.warmup
+                                                and lv > a.spike_factor * loss_ema)
+            if spike and a.spike_factor > 0:
+                skipped += 1
+                print(json.dumps({"step": step, "skipped_spike_loss": lv, "typical_loss": loss_ema,
+                                  "scenes": [int(x) for x in batch["scene"]]}))
+                sched.step(); step += 1
+            else:
+                loss.backward()
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
+                opt.step(); sched.step(); step += 1
+                running.append(lv)
+                loss_ema = lv if loss_ema is None else 0.98 * loss_ema + 0.02 * lv
             if step % a.log_every == 0:
-                rec = {"step": step, "loss": float(np.mean(running)), "grad_norm": float(gnorm),
+                rec = {"step": step, "loss": float(np.mean(running)) if running else float("nan"),
+                       "loss_max": float(np.max(running)) if running else float("nan"),
+                       "grad_norm": float(gnorm), "skipped": skipped,
                        "lr": sched.get_last_lr()[0], "sec_per_step": (time.time() - t0) / a.log_every}
                 print(json.dumps(rec)); log.write(json.dumps(rec) + "\n"); log.flush()
-                running, t0 = [], time.time()
+                running, t0, skipped = [], time.time(), 0
             if step % a.eval_every == 0 or step == a.steps:
-                score = evaluate(model, val_loader, device, amp, a.eval_batches,
-                                 save_grid=out / f"samples_{step:07d}.png")
-                rec = {"step": step, "val_psnr": score}
+                score, base = evaluate(model, val_loader, device, amp, a.eval_batches,
+                                       save_grid=out / f"samples_{step:07d}.png")
+                rec = {"step": step, "val_psnr": score, "baseline_psnr": base}
                 print(json.dumps(rec)); log.write(json.dumps(rec) + "\n"); log.flush()
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                             "sched": sched.state_dict(), "step": step, "args": vars(a)}, out / "last.pt")
@@ -416,8 +454,13 @@ def parse_args():
     g.add_argument("--layers", type=int, default=8)
     g.add_argument("--dim_per_g", type=int, default=32, help="hidden channels per group element")
     g.add_argument("--heads_per_g", type=int, default=2, help="attention heads per group element")
-    g.add_argument("--rope_sigma", type=float, default=1.0)
+    g.add_argument("--rope_sigma", type=float, default=0.0,
+                   help="highest RoPE frequency (rad per unit); <=0 = auto from focal length / patch size")
     g.add_argument("--drop_path", type=float, default=0.0)
+    g.add_argument("--bounded_output", type=int, default=1,
+                   help="regression: squash predicted pixels into [-1,1] with tanh (1/0)")
+    g.add_argument("--qk_norm", type=int, default=1,
+                   help="normalise queries/keys before attention (1/0); prevents sudden loss spikes")
     g.add_argument("--compile", action="store_true")
     g = p.add_argument_group("flow matching")
     g.add_argument("--sigma_data", type=float, default=0.5, help="std of target pixels in [-1,1]")
@@ -436,6 +479,8 @@ def parse_args():
     g.add_argument("--weight_decay", type=float, default=0.05)
     g.add_argument("--warmup", type=int, default=2000)
     g.add_argument("--grad_clip", type=float, default=1.0)
+    g.add_argument("--spike_factor", type=float, default=10.0,
+                   help="skip a batch whose loss exceeds this x the running loss (0 = never skip)")
     g.add_argument("--log_every", type=int, default=50)
     g.add_argument("--eval_every", type=int, default=2000)
     g.add_argument("--eval_batches", type=int, default=8)

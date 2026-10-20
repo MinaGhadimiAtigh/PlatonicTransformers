@@ -19,7 +19,7 @@ SAMPLER="${SAMPLER:-edm}"   # "edm" (Karras/Heun + S_churn) or "fm" (plain ODE i
 
 cd "$PROJECT_DIR"
 
-if [[ ! -x "$PROJECT_DIR/venv/bin/python" ]]; then
+if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
     echo "Missing Platonic Transformers environment: $PROJECT_DIR/.venv/bin/python" >&2
     echo "Create it first with setup.sh or uv venv -p 3.12.4 && uv pip install -r requirements.txt" >&2
     exit 1
@@ -35,7 +35,7 @@ if [[ ! -f "$QM9_DATA_DIR/processed_qm9_data.pkl" ]]; then
     echo "Warning: processed_qm9_data.pkl is missing; the first run will preprocess QM9." >&2
 fi
 
-"$PROJECT_DIR/venv/bin/python" mains/main_qm9_gen_FM.py \
+"$PROJECT_DIR/.venv/bin/python" mains/main_qm9_gen_FM.py \
     --dataset.data_dir="$QM9_DATA_DIR" \
     --system.gpus=1 \
     --logging.enabled=true \
