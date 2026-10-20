@@ -1,0 +1,117 @@
+# NVS Unconditional Scene Generation — Flow Matching on PlatonicAutoencoder latents
+
+seed: 42
+
+# Autoencoder (frozen encoder) — path to the trained checkpoint directory
+autoencoder:
+  checkpoint_dir: /media/mina/hdd/amlab/nvsm/ae_grav_dense_dec4_v55_20k_trivial_rayinit_bias_noaug
+
+# Dataset — same ovs.Dataset as the autoencoder training
+dataset:
+  dataset_name: psplat.data.ovs.Dataset
+  data_dir: /media/mina/hdd/amlab/nvsm/gravity512v16_dense
+  dataset_fraction: 1.0             # Downsample training set for debugging
+
+# Model architecture — FM network (PlatonicTransformer)
+# n_tokens and scalar_dim are read from the autoencoder config automatically
+model:
+  name: "platoformer"
+  hidden_dim: 512
+  num_layers: 8
+  num_heads: 16
+  solid_name: "trivial"             # should match autoencoder solid_name
+  spatial_dim: 3
+  dense_mode: true                  # (B, n_tokens, D) format — fixed token count
+
+  scalar_task_level: "node"
+  vector_task_level: "node"
+  ffn_readout: true
+
+  mean_aggregation: false
+  attention: true
+  dropout: 0.0
+  drop_path_rate: 0.0
+  layer_scale_init_value: null
+  ffn_dim_factor: 4
+
+  rope_sigma: 4.0
+  ape_sigma: null
+  learned_freqs: true
+  freq_init: "spiral"
+  use_key: false
+  rope_on_values: true
+  compile: true
+  attention_backend: "flash"
+
+# Flow Matching / diffusion configuration
+diffusion:
+  sigma_data: 1.0
+  P_mean: -1.2
+  P_std: 1.2
+  avg_num_nodes: 256                # fixed — always 256 register tokens per scene
+
+  # FM ODE sampler
+  fm_ode_order: 1                   # 1=Euler, 2=Heun (use Euler for stability at init)
+
+  # EDM sampler
+  num_steps: 50
+  sigma_min: 0.002
+  sigma_max: 1.0
+  rho: 7.0
+  S_churn: 0.0                      # 0 = deterministic, >0 = stochastic
+
+  # Sampler selection for validation/inference ablation
+  sampler: "fm_ode"                 # "fm_ode" | "edm"
+
+# Training configuration
+training:
+  epochs: 200
+  batch_size: 16
+  gradient_clip_val: 0.5
+  train_augm: true                  # SO(3) rotation augmentation on pos_z
+  validation_frequency: 10          # run sampling-based validation every N epochs
+  check_val_every_n_epoch: 1
+
+  ema_enabled: true
+  ema_decay: 0.999
+  ema_warmup_steps: 2000
+
+# Optimizer
+optimizer:
+  name: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+
+# Scheduler
+scheduler:
+  name: "cosine"
+  use_cosine: true
+  T_max_epochs: null                # defaults to training.epochs
+
+# Logging
+logging:
+  enabled: true
+  project_name: "Platonic-NVS-FM"
+  wandb_identity: null
+  log_every_n_steps: 50
+
+# System
+system:
+  gpus: 1
+  num_workers: 4
+  enable_progress_bar: true
+  timer: null
+  precision: "32"
+  float32_matmul_precision: "high"
+
+# Testing / checkpointing
+testing:
+  test_ckpt: null
+  resume_ckpt: null
+  metrics_out: null
+
+# Checkpoint
+checkpoint:
+  monitor: "val/loss"
+  mode: "min"
+  save_last: true
