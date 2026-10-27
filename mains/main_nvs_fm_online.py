@@ -10,6 +10,8 @@ Key differences from QM9FMModel:
   - Fixed token count (256) — no num_atoms_sampler needed
   - dense_mode=True — tokens already batched as (B, 256, D), no packing needed
   - Frozen encoder runs inside training_step to get (z_feat, pos_z) from images
+  - repeats_per_epoch: each scene encoded N times per epoch with different views
+  - copy_ratio: nearest-neighbour distance logged to detect memorisation
 """
 
 import os
@@ -35,58 +37,191 @@ from platonic_transformers.utils.utils import RandomSOd
 from psplat.models.platonic_autoencoder import PlatonicAutoencoder
 
 
+# ---------------------------------------------------------------------------
+# Latent normaliser
+# ---------------------------------------------------------------------------
+
+class LatentNormaliser:
+    """Computes and stores normalisation statistics for scene latents.
+
+    - features: subtract global mean, divide by global std → unit Gaussian
+    - positions: subtract per-token mean (centre each cloud), divide by global std
+    """
+
+    def __init__(self, feat_mean, feat_std, pos_std):
+        self.feat_mean = feat_mean   # (1, 1, F)
+        self.feat_std  = feat_std    # (1, 1, F)
+        self.pos_std   = pos_std     # scalar
+
+    @classmethod
+    def fit(cls, pos_list, feat_list):
+        feat = torch.cat(feat_list, dim=0)
+        pos  = torch.cat(pos_list,  dim=0)
+        feat_mean = feat.mean(dim=(0, 1), keepdim=True)
+        feat_std  = feat.std(dim=(0, 1),  keepdim=True).clamp(min=1e-6)
+        pos_c   = pos - pos.mean(dim=1, keepdim=True)
+        pos_std = pos_c.std().clamp(min=1e-6)
+        print(f"[normaliser] feat mean={feat_mean.abs().mean():.4f}  "
+              f"feat std={feat_std.mean():.4f}  pos std={pos_std:.4f}")
+        return cls(feat_mean, feat_std, pos_std)
+
+    def normalise(self, pos, feat):
+        dev = feat.device
+        pos_c = pos - pos.mean(dim=1, keepdim=True)
+        return pos_c / self.pos_std.to(dev), (feat - self.feat_mean.to(dev)) / self.feat_std.to(dev)
+
+    def denormalise(self, pos_n, feat_n):
+        dev = feat_n.device
+        return pos_n * self.pos_std.to(dev), feat_n * self.feat_std.to(dev) + self.feat_mean.to(dev)
+
+    def state_dict(self):
+        return {"feat_mean": self.feat_mean, "feat_std": self.feat_std, "pos_std": self.pos_std}
+
+    @classmethod
+    def from_state_dict(cls, d):
+        return cls(d["feat_mean"], d["feat_std"], d["pos_std"])
+
+
+@torch.no_grad()
+def fit_normaliser(autoencoder, train_loader, n_passes=2, device="cuda"):
+    print(f"[normaliser] fitting from {n_passes} passes over training set...")
+    pos_all, feat_all = [], []
+    autoencoder = autoencoder.to(device)
+    autoencoder.eval()
+    for pass_i in range(n_passes):
+        for batch in train_loader:
+            batch_d = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            input, _ = autoencoder.process_data(
+                batch_d, has_target_image=False, target_has_input=False, compute_rays=True,
+            )
+            z_feat, pos_z, _ = autoencoder.encode(input)
+            pos_all.append(pos_z.cpu())
+            feat_all.append(z_feat.cpu())
+        print(f"[normaliser] pass {pass_i+1}/{n_passes} done ({len(pos_all)} batches total)")
+    return LatentNormaliser.fit(pos_all, feat_all)
+
+
+# ---------------------------------------------------------------------------
+# Repeated dataset wrapper (repeats_per_epoch)
+# ---------------------------------------------------------------------------
+
+class RepeatedDataset(torch.utils.data.Dataset):
+    """Wraps a dataset to repeat each scene N times per epoch.
+
+    Each repeat calls __getitem__ fresh, so the ovs.Dataset view-sampler
+    picks a different random set of views each time. This multiplies the
+    effective number of view combinations seen per epoch by N, acting as
+    strong data augmentation for small datasets.
+
+    Example: 512 scenes × repeats=4 = 2048 items per epoch, each with
+    a different random view subset from the same scene.
+    """
+
+    def __init__(self, dataset, repeats: int):
+        self.dataset = dataset
+        self.repeats = repeats
+
+    def __len__(self):
+        return len(self.dataset) * self.repeats
+
+    def __getitem__(self, idx):
+        # map repeated index back to original scene index
+        return self.dataset[idx % len(self.dataset)]
+
+
+# ---------------------------------------------------------------------------
+# Copy ratio utility
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_copy_ratio(gen_feats, train_feats, threshold_quantile: float = 0.05):
+    """Compute nearest-neighbour distance between generated and training latents.
+
+    For each generated scene, find the closest training scene by L2 distance
+    on the mean-pooled z_feat (384-dim → scalar distance). Returns:
+      - mean_nn_dist:  mean distance to nearest training neighbour
+      - copy_ratio:    fraction of generated scenes closer than threshold
+                       (threshold = threshold_quantile of pairwise train distances)
+
+    Args:
+        gen_feats:   (G, N, F) — generated z_feat from sample()
+        train_feats: (T, N, F) — all training z_feat from encode()
+        threshold_quantile: quantile of pairwise train distances used as copy threshold
+
+    Returns:
+        dict with mean_nn_dist and copy_ratio
+    """
+    # Mean-pool over tokens → (G, F) and (T, F)
+    g = gen_feats.mean(dim=1).float()    # (G, F)
+    t = train_feats.mean(dim=1).float()  # (T, F)
+
+    # Pairwise L2 distances: (G, T)
+    # ||g_i - t_j||^2 = ||g_i||^2 + ||t_j||^2 - 2 g_i . t_j
+    g_sq = (g ** 2).sum(dim=-1, keepdim=True)   # (G, 1)
+    t_sq = (t ** 2).sum(dim=-1, keepdim=True).T # (1, T)
+    gt   = g @ t.T                               # (G, T)
+    dists_gen_train = (g_sq + t_sq - 2 * gt).clamp(min=0).sqrt()  # (G, T)
+    nn_dists = dists_gen_train.min(dim=1).values  # (G,) nearest neighbour distance
+
+    # Threshold: quantile of pairwise training distances
+    T = t.shape[0]
+    if T > 1:
+        t_sq2 = (t ** 2).sum(dim=-1, keepdim=True)
+        tt = t @ t.T
+        dists_train = (t_sq2 + t_sq2.T - 2 * tt).clamp(min=0).sqrt()
+        # exclude diagonal (self-distance = 0)
+        mask = ~torch.eye(T, dtype=torch.bool, device=t.device)
+        pairwise = dists_train[mask]
+        threshold = torch.quantile(pairwise.float(), threshold_quantile)
+    else:
+        threshold = torch.tensor(float("inf"))
+
+    copy_ratio = (nn_dists < threshold).float().mean().item()
+    mean_nn_dist = nn_dists.mean().item()
+
+    return {"val/mean_nn_dist": mean_nn_dist, "val/copy_ratio": copy_ratio}
+
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
+
 class NVSFMModel(pl.LightningModule):
     """Node-wise conditional flow matching model for NVS scene latents."""
 
     def __init__(self, config, autoencoder):
-        """
-        Args:
-            config: ml_collections.ConfigDict — same structure as QM9FM config.
-            autoencoder: frozen PlatonicAutoencoder instance — used to encode
-                         raw image batches into (z_feat, pos_z) during training.
-        """
         super().__init__()
         self.config = config
 
-        # --- Frozen encoder ---
-        # We keep the full autoencoder so we can call .process_data() and .encode()
-        # in training_step. All parameters are frozen — no gradients flow into it.
+        # Frozen encoder
         self.autoencoder = autoencoder
         self.autoencoder.eval()
         for param in self.autoencoder.parameters():
             param.requires_grad_(False)
 
-        # --- Dimensions (read from the autoencoder's own config) ---
-        # n_reg comes from autoencoder config.model.registers.n_reg
-        # d     comes from autoencoder config.model.transformer.d
-        # With trivial group (G=1), invariant mode gives d/G = d, so scalar_dim = d
+        # Dimensions from autoencoder config
         ae_cfg = autoencoder.config
-        self.n_tokens = int(ae_cfg.model.registers.n_reg)
-        ae_group_name = ae_cfg.model.equivariance.solid_name.lower()
-        ae_group = PLATONIC_GROUPS[ae_group_name]
+        self.n_tokens  = int(ae_cfg.model.registers.n_reg)
+        ae_group_name  = ae_cfg.model.equivariance.solid_name.lower()
+        ae_group       = PLATONIC_GROUPS[ae_group_name]
         self.scalar_dim = int(ae_cfg.model.transformer.d) // ae_group.G
 
-        # --- Flow matching network ---
-        # Mirrors QM9FMModel.net but with:
-        #   input_dim  = scalar_dim + 1  (384 features + 1 c_noise time embedding)
-        #   output_dim = scalar_dim      (384, predicts velocity in feature space)
-        #   output_dim_vec = 1           (one 3D vector per token, velocity in position space)
-        #   dense_mode = True            (input is (B, 256, D), not packed flat)
+        # Flow matching network
         solid_name = config.model.solid_name.lower()
         if solid_name not in PLATONIC_GROUPS:
             raise ValueError(f"Unsupported solid_name '{solid_name}'")
 
         self.net = PlatonicTransformer(
-            input_dim=self.scalar_dim + 1,       # 385: features + c_noise
-            input_dim_vec=0,                      # no vector input
+            input_dim=self.scalar_dim + 1,
+            input_dim_vec=0,
             hidden_dim=config.model.hidden_dim,
-            output_dim=self.scalar_dim,           # 384: velocity in feature space
-            output_dim_vec=1,                     # velocity in position space (3D)
+            output_dim=self.scalar_dim,
+            output_dim_vec=1,
             nhead=config.model.num_heads,
             num_layers=config.model.num_layers,
             solid_name=solid_name,
             spatial_dim=config.model.spatial_dim,
-            dense_mode=True,                      # (B, 256, D) format, no batch index
+            dense_mode=True,
             scalar_task_level="node",
             vector_task_level="node",
             ffn_readout=config.model.ffn_readout,
@@ -108,154 +243,113 @@ class NVSFMModel(pl.LightningModule):
         if config.model.get("compile", True):
             self.net = torch.compile(self.net)
 
-        # Random SO(3) rotation for data augmentation during training
         self.rotation_generator = RandomSOd(3)
+        self.normaliser = None
+        self.val_dataset = None
+
+        # Cache of training latents for copy_ratio — built lazily
+        self._train_feats_cache = None
+
+    # -----------------------------------------------------------------------
+    # Setup helpers
+    # -----------------------------------------------------------------------
+
+    def set_normaliser(self, normaliser: LatentNormaliser):
+        self.normaliser = normaliser
+        print(f"[NVSFMModel] normaliser set: "
+              f"feat_std={normaliser.feat_std.mean():.4f}  pos_std={normaliser.pos_std:.4f}")
+
+    def set_val_dataset(self, val_dataset):
+        self.val_dataset = val_dataset
+
+    def set_train_loader(self, train_loader):
+        """Store train loader so we can encode all training scenes for copy_ratio."""
+        self._train_loader = train_loader
+
+    # -----------------------------------------------------------------------
+    # Core FM math
+    # -----------------------------------------------------------------------
 
     def _sample_t(self, batch_size, device):
-        """Sample one flow-matching time t per scene.
-
-        Identical to QM9FMModel: uses EDM's log-normal sigma schedule mapped
-        to t via t = 1/(1+sigma), focusing training on intermediate timesteps.
-
-        Returns shape (B,) — one t per scene, not per token.
-        """
         rnd_normal = torch.randn(batch_size, device=device)
         sigma = (rnd_normal * self.config.diffusion.P_std + self.config.diffusion.P_mean).exp()
         return 1.0 / (1.0 + sigma)
 
     def _edm_weight(self, t):
-        """Per-token loss weight = 1/c_out(t)^2.
-
-        Identical to QM9FMModel. Bounded in [0.5, 1] — never explodes.
-        t has shape (B, 1, 1) when called from training_step, broadcasting
-        over the (B, n_tokens, scalar_dim) feature tensor.
-        """
         sigma_data = self.config.diffusion.sigma_data
         return (t ** 2 * sigma_data ** 2 + (1 - t) ** 2) / sigma_data ** 2
 
     def _velocity(self, x_t, pos_t, t):
-        """EDM-preconditioned flow-matching velocity field.
-
-        Same math as QM9FMModel._velocity, adapted for dense (B, N, D) format.
-
-        Args:
-            x_t:   (B, n_tokens, scalar_dim)  — interpolated features at time t
-            pos_t: (B, n_tokens, 3)           — interpolated positions at time t
-            t:     (B,)                        — one time value per scene
-
-        Returns:
-            v_x:   (B, n_tokens, scalar_dim)  — predicted velocity in feature space
-            v_pos: (B, n_tokens, 3)           — predicted velocity in position space
-        """
         sigma_data = self.config.diffusion.sigma_data
+        t_ = t[:, None, None]
+        denom   = t_ ** 2 * sigma_data ** 2 + (1 - t_) ** 2
+        c_in    = 1.0 / denom.sqrt()
+        c_skip  = (t_ * sigma_data ** 2 - (1 - t_)) / denom
+        c_out   = sigma_data / denom.sqrt()
+        c_noise = (((1 - t_) / t_).log() / 4).expand(x_t.shape[0], x_t.shape[1], 1)
 
-        # t is (B,) → reshape to (B, 1, 1) so it broadcasts over (B, n_tokens, D)
-        # In QM9FM this was done via t[batch] to expand per-atom;
-        # here dense_mode means we just unsqueeze twice.
-        t_ = t[:, None, None]                                        # (B, 1, 1)
+        x_in      = c_in * x_t
+        pos_in    = c_in * pos_t
+        scalar_in = torch.cat([x_in, c_noise], dim=-1)
 
-        denom  = t_ ** 2 * sigma_data ** 2 + (1 - t_) ** 2          # (B, 1, 1)
-        c_in   = 1.0 / denom.sqrt()                                  # normalize input
-        c_skip = (t_ * sigma_data ** 2 - (1 - t_)) / denom          # linear baseline
-        c_out  = sigma_data / denom.sqrt()                           # residual scale
-        # c_noise: encode t as log SNR, appended to features as time embedding
-        # shape (B, n_tokens, 1) so it can be cat'd along the feature dim
-        c_noise = (((1 - t_) / t_).log() / 4).expand(
-            x_t.shape[0], x_t.shape[1], 1                           # (B, n_tokens, 1)
-        )
-
-        # Normalize inputs to unit variance
-        x_in   = c_in * x_t                                          # (B, n_tokens, scalar_dim)
-        pos_in = c_in * pos_t                                         # (B, n_tokens, 3)
-
-        # Append time embedding to scalar features
-        scalar_in = torch.cat([x_in, c_noise], dim=-1)               # (B, n_tokens, scalar_dim+1)
-
-        # Network call — dense_mode=True, so batch=None
         scalar_out, vector_out = self.net(
             scalar_in, pos_in, batch=None,
             avg_num_nodes=self.config.diffusion.avg_num_nodes,
         )
-        # scalar_out: (B, n_tokens, scalar_dim)
-        # vector_out: (B, n_tokens, 1, 3) → squeeze to (B, n_tokens, 3)
 
-        # Blend linear baseline with network residual
-        v_x   = c_skip * x_t   + c_out * scalar_out                  # (B, n_tokens, scalar_dim)
-        v_pos = c_skip * pos_t + c_out * vector_out.squeeze(-2)       # (B, n_tokens, 3)
-
+        v_x   = c_skip * x_t   + c_out * scalar_out
+        v_pos = c_skip * pos_t + c_out * vector_out.squeeze(-2)
         return v_x, v_pos
 
+    # -----------------------------------------------------------------------
+    # Encode
+    # -----------------------------------------------------------------------
+
     def _encode(self, batch):
-        """Run the frozen autoencoder encoder on a raw image batch.
-
-        Calls process_data() to compute rays from cameras, then encode()
-        to get the scene latent. Runs under torch.no_grad() since the
-        autoencoder is frozen.
-
-        Args:
-            batch: dict from ovs.Dataset with keys:
-                   image (B, V, 3, H, W), c2w (B, V, 4, 4), fxfycxcy (B, V, 4), ...
-
-        Returns:
-            x1:   (B, n_tokens, scalar_dim)  — clean scene features  (our "data")
-            pos1: (B, n_tokens, 3)           — clean token positions
-        """
+        """Encode a raw image batch → (z_feat, pos_z), optionally normalised."""
         with torch.no_grad():
-            # process_data splits views and computes Plücker rays
-            # input gets the first num_input_views views
             input, _ = self.autoencoder.process_data(
-                batch,
-                has_target_image=False,   # we don't need target images for encoding
-                target_has_input=False,
-                compute_rays=True,
+                batch, has_target_image=False, target_has_input=False, compute_rays=True,
             )
-            # encode returns (z_feat, pos_z, pos_reg_init)
-            # z_feat: (B, n_tokens, scalar_dim)
-            # pos_z:  (B, n_tokens, 3)
             z_feat, pos_z, _ = self.autoencoder.encode(input)
 
+        if self.normaliser is not None:
+            pos_z, z_feat = self.normaliser.normalise(pos_z, z_feat)
         return z_feat, pos_z
 
+    # -----------------------------------------------------------------------
+    # Training / validation steps
+    # -----------------------------------------------------------------------
+
     def training_step(self, batch, batch_idx):
-        # --- Step 1: encode raw images → clean latent (x1, pos1) ---
-        x1, pos1 = self._encode(batch)           # (B, n_tokens, scalar_dim), (B, n_tokens, 3)
+        x1, pos1 = self._encode(batch)
         B = x1.shape[0]
 
-        # --- Step 2: optional SO(3) augmentation on positions ---
         if self.config.training.train_augm:
-            rot = self.rotation_generator().type_as(pos1)            # (3, 3)
-            pos1 = torch.einsum("ij,bnj->bni", rot, pos1)           # rotate all tokens
+            rot  = self.rotation_generator().type_as(pos1)
+            pos1 = torch.einsum("ij,bnj->bni", rot, pos1)
 
-        # --- Step 3: sample t — one per scene ---
-        t = self._sample_t(B, x1.device)                            # (B,)
+        t   = self._sample_t(B, x1.device)
+        t_  = t[:, None, None]
+        x0  = torch.randn_like(x1)
+        pos0 = torch.randn_like(pos1)
+        x_t   = (1 - t_) * x0   + t_ * x1
+        pos_t = (1 - t_) * pos0 + t_ * pos1
 
-        # --- Step 4: sample noise (x0, pos0) ~ N(0, I) ---
-        x0   = torch.randn_like(x1)                                 # (B, n_tokens, scalar_dim)
-        pos0 = torch.randn_like(pos1)                               # (B, n_tokens, 3)
-
-        # --- Step 5: interpolate to get (x_t, pos_t) ---
-        t_ = t[:, None, None]                                       # (B, 1, 1) for broadcasting
-        x_t   = (1 - t_) * x0   + t_ * x1                         # (B, n_tokens, scalar_dim)
-        pos_t = (1 - t_) * pos0 + t_ * pos1                        # (B, n_tokens, 3)
-
-        # --- Step 6: predict velocity ---
         vx, vp = self._velocity(x_t, pos_t, t)
-
-        # --- Step 7: weighted MSE loss against true velocity (x1-x0, pos1-pos0) ---
-        weight = self._edm_weight(t_)                               # (B, 1, 1)
+        weight = self._edm_weight(t_)
         loss = (
             (weight * (vx - (x1 - x0)).square()).mean()
           + (weight * (vp - (pos1 - pos0)).square()).mean()
         )
 
-        self.log("train/loss", loss, on_step=True, on_epoch=True,
-                 logger=True, batch_size=B)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, logger=True, batch_size=B)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x1, pos1 = self._encode(batch)
         B = x1.shape[0]
-        t = self._sample_t(B, x1.device)
+        t  = self._sample_t(B, x1.device)
         t_ = t[:, None, None]
         x0, pos0 = torch.randn_like(x1), torch.randn_like(pos1)
         x_t   = (1 - t_) * x0   + t_ * x1
@@ -266,29 +360,40 @@ class NVSFMModel(pl.LightningModule):
             (weight * (vx - (x1 - x0)).square()).mean()
           + (weight * (vp - (pos1 - pos0)).square()).mean()
         )
-        self.log("val/loss", loss, on_step=False, on_epoch=True,
-                 logger=True, batch_size=B)
+        self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True, batch_size=B)
         return loss
 
-    def set_val_dataset(self, val_dataset):
-        """Store a reference to the val dataset so on_validation_epoch_end
-        can access full scene cameras. Called from main() after model creation."""
-        self.val_dataset = val_dataset
+    # -----------------------------------------------------------------------
+    # Full validation: render + copy_ratio
+    # -----------------------------------------------------------------------
+
+    def _build_train_feats_cache(self, device):
+        """Encode all training scenes once and cache z_feat for copy_ratio.
+
+        Uses the stored train_loader. Runs under no_grad, frozen encoder.
+        Returns (T, n_tokens, scalar_dim) tensor on CPU.
+        """
+        if not hasattr(self, "_train_loader") or self._train_loader is None:
+            return None
+        print("[copy_ratio] encoding training set for cache...")
+        all_feats = []
+        for batch in self._train_loader:
+            batch_d = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            with torch.no_grad():
+                input, _ = self.autoencoder.process_data(
+                    batch_d, has_target_image=False, target_has_input=False, compute_rays=True,
+                )
+                z_feat, _, _ = self.autoencoder.encode(input)
+            all_feats.append(z_feat.cpu())
+        cache = torch.cat(all_feats, dim=0)  # (T, N, F)
+        print(f"[copy_ratio] cached {cache.shape[0]} training scenes")
+        return cache
 
     def on_validation_epoch_end(self):
-        """Render generated and real scenes and log to wandb.
-
-        For each of n_scenes:
-          - sample a new latent from noise → render from 5 val cameras
-          - encode a real val scene        → render from same 5 val cameras
-        Log both as image grids side by side so we can track quality over time.
-        """
-        # only run every validation_frequency epochs to save time
         freq = self.config.training.validation_frequency
         if (self.current_epoch + 1) % freq != 0:
             return
 
-        # need wandb logger and val dataset
         if not hasattr(self, "val_dataset") or self.val_dataset is None:
             return
         logger = self.trainer.logger if self.trainer is not None else None
@@ -299,90 +404,73 @@ class NVSFMModel(pl.LightningModule):
             import wandb
             import numpy as np
 
-            n_scenes   = 4    # number of scenes to render
-            view_idxs  = [0, 3, 6, 9, 12]   # 5 evenly spaced views from the 16 available
-            n_views    = len(view_idxs)
-            device     = next(self.net.parameters()).device
-            sampler    = self.config.diffusion.get("sampler", "fm_ode")
-            image_h_w  = (128, 128)
+            n_scenes  = 4
+            view_idxs = [0, 3, 6, 9, 12]
+            n_views   = len(view_idxs)
+            device    = next(self.net.parameters()).device
+            sampler   = self.config.diffusion.get("sampler", "fm_ode")
+            image_h_w = (128, 128)
 
             # --- sample generated latents ---
             z_gen, pos_gen = self.sample(n_scenes, sampler=sampler)
-            # z_gen:   (n_scenes, 256, 384)
-            # pos_gen: (n_scenes, 256, 3)
 
-            generated_panels = []   # will hold wandb.Image objects
+            # --- copy_ratio: build training cache once per run ---
+            if self._train_feats_cache is None:
+                self._train_feats_cache = self._build_train_feats_cache(device)
+
+            if self._train_feats_cache is not None:
+                cr = compute_copy_ratio(
+                    z_gen.cpu(),
+                    self._train_feats_cache,
+                    threshold_quantile=self.config.training.get("copy_ratio_quantile", 0.05),
+                )
+                logger.experiment.log({
+                    "val/mean_nn_dist": cr["val/mean_nn_dist"],
+                    "val/copy_ratio":   cr["val/copy_ratio"],
+                    "trainer/global_step": self.global_step,
+                })
+                print(f"[copy_ratio] epoch {self.current_epoch} | "
+                      f"mean_nn_dist={cr['val/mean_nn_dist']:.4f} | "
+                      f"copy_ratio={cr['val/copy_ratio']:.3f}")
+
+            # --- render images ---
+            generated_panels = []
             real_panels      = []
 
+            def to_grid(images):
+                imgs = images[0]
+                imgs = torch.nan_to_num(imgs, nan=0.0).clamp(0, 1)
+                imgs = (imgs * 255).byte().cpu().numpy()
+                row  = np.concatenate([imgs[v] for v in range(n_views)], axis=2)
+                return row.transpose(1, 2, 0)
+
             for scene_i in range(n_scenes):
-                # --- get cameras from a fixed val scene ---
-                # use scene_i as scene index so we always use the same scenes
                 scene_data = self.val_dataset.scene_batch(
-                    scene_idx=scene_i,
-                    view_indices=view_idxs,
-                    device=device,
+                    scene_idx=scene_i, view_indices=view_idxs, device=device,
                 )
-                # scene_data shapes: image (1,5,3,H,W), c2w (1,5,4,4), fxfycxcy (1,5,4)
-
-                # compute rays from cameras
                 ray_o, ray_d = self.autoencoder.process_data.compute_rays(
-                    scene_data["c2w"],
-                    scene_data["fxfycxcy"],
-                    h=image_h_w[0],
-                    w=image_h_w[1],
-                    device=device,
+                    scene_data["c2w"], scene_data["fxfycxcy"],
+                    h=image_h_w[0], w=image_h_w[1], device=device,
                 )
-                # ray_o: (1, n_views, 3, H, W)
-                # ray_d: (1, n_views, 3, H, W)
 
-                # --- render generated scene ---
-                z_i   = z_gen[scene_i:scene_i+1]     # (1, 256, 384)
-                pos_i = pos_gen[scene_i:scene_i+1]   # (1, 256, 3)
-                # Normalize generated latents to unit std before decoding.
-                # The untrained network produces out-of-distribution latents
-                # (large values) that cause NaN in the decoder. After training
-                # this normalization becomes a no-op since the FM model learns
-                # to produce latents matching the real distribution (std ≈ 1.5).
-                z_std = z_i.std().clamp(min=1e-6)
-                z_i   = z_i / z_std
+                # generated
+                z_i   = z_gen[scene_i:scene_i+1]
+                pos_i = pos_gen[scene_i:scene_i+1]
                 gen_images = self.render(z_i, pos_i, ray_o, ray_d, image_h_w)
-                # gen_images: (1, n_views, 3, H, W)
 
-                # --- encode real scene and render ---
-                # directly feed the 5 views into the encoder
-                # scene_data already has image (1,5,3,H,W) and c2w (1,5,4,4)
-                # so we can call encode() after computing rays manually
+                # real encoded
                 with torch.no_grad():
-                    enc_ray_o, enc_ray_d = self.autoencoder.process_data.compute_rays(
-                        scene_data["c2w"],
-                        scene_data["fxfycxcy"],
-                        h=image_h_w[0],
-                        w=image_h_w[1],
-                        device=device,
-                    )
                     from easydict import EasyDict as edict
+                    enc_ray_o, enc_ray_d = self.autoencoder.process_data.compute_rays(
+                        scene_data["c2w"], scene_data["fxfycxcy"],
+                        h=image_h_w[0], w=image_h_w[1], device=device,
+                    )
                     input_enc = edict({
-                        "image":     scene_data["image"],   # (1, 5, 3, H, W)
-                        "ray_o":     enc_ray_o,             # (1, 5, 3, H, W)
-                        "ray_d":     enc_ray_d,             # (1, 5, 3, H, W)
-                        "image_h_w": image_h_w,
+                        "image": scene_data["image"], "ray_o": enc_ray_o,
+                        "ray_d": enc_ray_d, "image_h_w": image_h_w,
                     })
                     z_real, pos_real, _ = self.autoencoder.encode(input_enc)
-                real_images = self.render(z_real, pos_real, ray_o, ray_d, image_h_w)
-                # real_images: (1, n_views, 3, H, W)
-
-                # --- convert to wandb image grid (one row = one scene, cols = views) ---
-                # squeeze batch dim, clamp to [0,1], convert to uint8
-                def to_grid(images):
-                    # images: (1, n_views, 3, H, W)
-                    imgs = images[0]
-                    imgs = torch.nan_to_num(imgs, nan=0.0)  # replace nan with black
-                    imgs = imgs.clamp(0, 1)                 # (n_views, 3, H, W)
-                    imgs = (imgs * 255).byte().cpu().numpy() # (n_views, 3, H, W)
-                    # concatenate views horizontally → (3, H, n_views*W)
-                    row = np.concatenate([imgs[v] for v in range(n_views)], axis=2)
-                    # to HWC for wandb
-                    return row.transpose(1, 2, 0)           # (H, n_views*W, 3)
+                real_images = self.render_raw(z_real, pos_real, ray_o, ray_d, image_h_w)
 
                 generated_panels.append(wandb.Image(
                     to_grid(gen_images),
@@ -393,7 +481,6 @@ class NVSFMModel(pl.LightningModule):
                     caption=f"real scene {scene_i} | epoch {self.current_epoch}"
                 ))
 
-            # log to wandb
             logger.experiment.log({
                 "val/generated_scenes": generated_panels,
                 "val/real_scenes":      real_panels,
@@ -409,26 +496,10 @@ class NVSFMModel(pl.LightningModule):
 
     @torch.no_grad()
     def sample(self, num_scenes: int, sampler: str = "fm_ode"):
-        """Generate num_scenes scene latents from pure noise.
-
-        Args:
-            num_scenes: number of scenes to generate.
-            sampler:    "fm_ode" — simple Euler/Heun ODE integration (default)
-                        "edm"   — Karras sigma schedule with stochasticity
-
-        Returns:
-            z_feat: (num_scenes, n_tokens, scalar_dim)  — generated scene features
-            pos_z:  (num_scenes, n_tokens, 3)           — generated token positions
-        """
         self.eval()
-
-        # torch.compile can produce NaN during inference with no_grad due to
-        # kernel selection issues. We temporarily swap to the uncompiled network
-        # for sampling and restore it afterwards.
         compiled_net = self.net
         if hasattr(self.net, "_orig_mod"):
             self.net = self.net._orig_mod
-
         try:
             if sampler == "fm_ode":
                 return self._sample_fm_ode(num_scenes)
@@ -440,79 +511,40 @@ class NVSFMModel(pl.LightningModule):
             self.net = compiled_net
 
     def _sample_fm_ode(self, num_scenes: int):
-        """Plain FM ODE sampler — Euler or Heun integration on a uniform time grid.
-
-        Integrates dz/dt = v(z, t) from t=0 (noise) to t=1 (data) using
-        num_steps uniform steps. Heun (2nd-order) is used when
-        config.diffusion.fm_ode_order == 2, otherwise Euler (1st-order).
-
-        Returns:
-            z_feat: (num_scenes, n_tokens, scalar_dim)
-            pos_z:  (num_scenes, n_tokens, 3)
-        """
         num_steps = self.config.diffusion.num_steps
-        order     = self.config.diffusion.get("fm_ode_order", 2)  # 1=Euler, 2=Heun
+        order     = self.config.diffusion.get("fm_ode_order", 1)
         device    = next(self.net.parameters()).device
 
-        # Start from pure noise at t=0
         x   = torch.randn(num_scenes, self.n_tokens, self.scalar_dim, device=device)
         pos = torch.randn(num_scenes, self.n_tokens, 3, device=device)
 
-        # Uniform time grid from eps → 1
-        # We avoid t=0 exactly because c_noise = log((1-t)/t) → -inf at t=0,
-        # causing NaN in _velocity. A small epsilon is numerically identical
-        # to starting at pure noise but avoids the singularity.
         eps = 1e-4
-        ts  = torch.linspace(eps, 1.0, num_steps + 1, device=device)  # (num_steps+1,)
-        dt  = ts[1] - ts[0]                                            # scalar
+        ts  = torch.linspace(eps, 1.0, num_steps + 1, device=device)
+        dt  = ts[1] - ts[0]
 
         for i in range(num_steps):
-            t_now  = ts[i].expand(num_scenes)     # (B,) — same t for all scenes in batch
+            t_now  = ts[i].expand(num_scenes)
             t_next = ts[i + 1].expand(num_scenes)
 
-            # Velocity at current point
-            # clamp to prevent NaN explosion from untrained network
             vx, vp = self._velocity(x, pos, t_now)
-            vx  = vx.clamp(-10, 10)
-            vp  = vp.clamp(-10, 10)
+            vx = vx.clamp(-10, 10)
+            vp = vp.clamp(-10, 10)
 
             if order == 1:
-                # Euler step
                 x   = x   + dt * vx
                 pos = pos + dt * vp
-
             else:
-                # Heun step (2nd-order):
-                # 1. Euler predictor to t_next
-                x_pred   = x   + dt * vx
-                pos_pred = pos + dt * vp
-                # clamp predictor before second velocity call —
-                # an untrained network can produce large velocities that push
-                # x_pred far out of distribution, causing NaN in _velocity.
-                # After training this clamp is effectively never active.
-                x_pred   = x_pred.clamp(-50, 50)
-                pos_pred = pos_pred.clamp(-50, 50)
-                # 2. Velocity at predicted point
+                x_pred   = (x   + dt * vx).clamp(-50, 50)
+                pos_pred = (pos + dt * vp).clamp(-50, 50)
                 vx2, vp2 = self._velocity(x_pred, pos_pred, t_next)
                 vx2 = vx2.clamp(-10, 10)
                 vp2 = vp2.clamp(-10, 10)
-                # 3. Corrector: average of both velocities
                 x   = x   + dt * 0.5 * (vx  + vx2)
                 pos = pos + dt * 0.5 * (vp  + vp2)
 
         return x, pos
 
     def _sample_edm(self, num_scenes: int):
-        """EDM-style stochastic sampler — Karras sigma schedule + Heun correction.
-
-        Converts between EDM's sigma and FM's t via t = 1/(1+sigma),
-        and uses the Karras et al. noise schedule for better sample quality.
-        Optionally adds stochasticity via S_churn.
-
-        Returns:
-            z_feat: (num_scenes, n_tokens, scalar_dim)
-            pos_z:  (num_scenes, n_tokens, 3)
-        """
         num_steps = self.config.diffusion.num_steps
         sigma_min = self.config.diffusion.sigma_min
         sigma_max = self.config.diffusion.sigma_max
@@ -521,56 +553,41 @@ class NVSFMModel(pl.LightningModule):
         S_noise   = self.config.diffusion.get("S_noise", 1.0)
         device    = next(self.net.parameters()).device
 
-        # Karras sigma schedule: sigmas[0]=sigma_max ... sigmas[-1]=sigma_min
         ramp   = torch.linspace(0, 1, num_steps, device=device)
         sigmas = (sigma_max ** (1/rho) + ramp * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
-        sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])  # append 0 at the end
+        sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
 
-        # Start from pure noise scaled by sigma_max
         x   = torch.randn(num_scenes, self.n_tokens, self.scalar_dim, device=device) * sigma_max
         pos = torch.randn(num_scenes, self.n_tokens, 3, device=device) * sigma_max
 
         for i in range(num_steps):
-            sigma     = sigmas[i]
+            sigma      = sigmas[i]
             sigma_next = sigmas[i + 1]
 
-            # Optional stochasticity: inject extra noise then step back
-            # (Karras et al. Algorithm 2, lines 6-8)
             if S_churn > 0 and sigma_next > 0:
                 gamma     = min(S_churn / num_steps, 2**0.5 - 1)
                 sigma_hat = sigma * (1 + gamma)
-                noise_x   = torch.randn_like(x)   * S_noise
-                noise_pos = torch.randn_like(pos) * S_noise
-                x   = x   + noise_x   * (sigma_hat**2 - sigma**2).sqrt()
-                pos = pos + noise_pos * (sigma_hat**2 - sigma**2).sqrt()
+                x   = x   + torch.randn_like(x)   * S_noise * (sigma_hat**2 - sigma**2).sqrt()
+                pos = pos + torch.randn_like(pos) * S_noise * (sigma_hat**2 - sigma**2).sqrt()
             else:
                 sigma_hat = sigma
 
-            # Convert sigma → t for our FM velocity field
-            # t = 1/(1+sigma) is the FM↔EDM correspondence
-            t_hat  = (1.0 / (1.0 + sigma_hat )).expand(num_scenes)   # (B,)
-            t_next = (1.0 / (1.0 + sigma_next)).expand(num_scenes)   # (B,)
+            t_hat  = (1.0 / (1.0 + sigma_hat)).expand(num_scenes)
+            t_next = (1.0 / (1.0 + sigma_next)).expand(num_scenes)
 
-            # Velocity at current sigma_hat
-            vx, vp = self._velocity(x, pos, t_hat)
-
-            # EDM denoiser estimate D from velocity:
-            # D = x_t + (1-t)*v  →  the "clean" prediction
-            t_hat_ = t_hat[:, None, None]
-            dx   = x   + (1 - t_hat_) * vx
-            dpos = pos + (1 - t_hat_) * vp
-
-            # Euler step in sigma space
+            vx, vp   = self._velocity(x, pos, t_hat)
+            t_hat_   = t_hat[:, None, None]
+            dx       = x   + (1 - t_hat_) * vx
+            dpos     = pos + (1 - t_hat_) * vp
             dt_sigma = sigma_next - sigma_hat
             x   = x   + (x   - dx  ) / sigma_hat * dt_sigma
             pos = pos + (pos - dpos) / sigma_hat * dt_sigma
 
-            # Heun 2nd-order correction (skip at last step)
             if sigma_next > 0:
                 vx2, vp2 = self._velocity(x, pos, t_next)
                 t_next_  = t_next[:, None, None]
-                dx2   = x   + (1 - t_next_) * vx2
-                dpos2 = pos + (1 - t_next_) * vp2
+                dx2      = x   + (1 - t_next_) * vx2
+                dpos2    = pos + (1 - t_next_) * vp2
                 x   = x   + (x   - dx  ) / sigma_hat * dt_sigma * 0.5 \
                           + (x   - dx2 ) / sigma_next * dt_sigma * 0.5
                 pos = pos + (pos - dpos ) / sigma_hat * dt_sigma * 0.5 \
@@ -582,34 +599,31 @@ class NVSFMModel(pl.LightningModule):
     # Rendering
     # -----------------------------------------------------------------------
 
-    @torch.no_grad()
-    def render(self, z_feat, pos_z, ray_o, ray_d, image_h_w):
-        """Decode generated latents into images using the frozen autoencoder decoder.
-
-        Args:
-            z_feat:    (B, n_tokens, scalar_dim)  — from sample()
-            pos_z:     (B, n_tokens, 3)           — from sample()
-            ray_o:     (B, Vt, 3, H, W)           — target camera ray origins
-            ray_d:     (B, Vt, 3, H, W)           — target camera ray directions
-            image_h_w: (H, W)                     — output image resolution
-
-        Returns:
-            images: (B, Vt, 3, H, W)  — rendered images
-        """
-        # Re-lift invariant latent back to equivariant tokens for the decoder
-        # (mirrors PlatonicAutoencoder.forward())
+    def _decode(self, z_feat, pos_z, ray_o, ray_d, image_h_w):
         if self.autoencoder.latent_mode == "invariant":
             from platonic_transformers.models.platoformer.io import lift_scalars
             z_lift = lift_scalars(z_feat, self.autoencoder.group).flatten(-2)
         else:
             z_lift = z_feat
+        return self.autoencoder.decode_views(z_lift, pos_z, ray_o, ray_d, image_h_w)
 
-        return self.autoencoder.decode_views(
-            z_lift, pos_z, ray_o, ray_d, image_h_w,
-        )
+    @torch.no_grad()
+    def render(self, z_feat, pos_z, ray_o, ray_d, image_h_w):
+        """Decode GENERATED (normalised-space) latents → images."""
+        if self.normaliser is not None:
+            pos_z, z_feat = self.normaliser.denormalise(pos_z, z_feat)
+        return self._decode(z_feat, pos_z, ray_o, ray_d, image_h_w)
+
+    @torch.no_grad()
+    def render_raw(self, z_feat, pos_z, ray_o, ray_d, image_h_w):
+        """Decode RAW AE-space latents → images (no denormalisation)."""
+        return self._decode(z_feat, pos_z, ray_o, ray_d, image_h_w)
+
+    # -----------------------------------------------------------------------
+    # Optimizer
+    # -----------------------------------------------------------------------
 
     def configure_optimizers(self):
-        # make_param_groups separates weight decay from bias/norm parameters
         optimizer = torch.optim.AdamW(
             make_param_groups(self, self.config.optimizer.weight_decay),
             lr=self.config.optimizer.lr,
@@ -617,8 +631,7 @@ class NVSFMModel(pl.LightningModule):
         if self.config.scheduler.use_cosine:
             T_max = self.config.scheduler.get("T_max_epochs", None) or self.trainer.max_epochs
             return {"optimizer": optimizer, "lr_scheduler": CosineAnnealingLR(
-                optimizer, T_max=T_max,
-                eta_min=self.config.optimizer.lr / 100,
+                optimizer, T_max=T_max, eta_min=self.config.optimizer.lr / 100,
             )}
         return optimizer
 
@@ -628,29 +641,13 @@ class NVSFMModel(pl.LightningModule):
 # ---------------------------------------------------------------------------
 
 def load_data(config: ml_collections.ConfigDict, ae_config: ml_collections.ConfigDict):
-    """Load train and val ovs.Dataset instances and wrap in DataLoaders.
-
-    Args:
-        config:    FM model config (nvs_fm.yaml)
-        ae_config: frozen autoencoder config — needed for model.image_tokenizer.*
-                   which the dataset reads to resize images correctly.
-
-    The dataset reads from three config sections:
-        config.training.*              — view counts, pose norm, augmentation
-        config.model.image_tokenizer.* — image_size and patch_size for resizing
-        config.inference.*             — inference mode flags
-    """
     import importlib
     module_path, class_name = config.dataset.dataset_name.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    DatasetClass = getattr(module, class_name)
+    DatasetClass = getattr(importlib.import_module(module_path), class_name)
 
     train_manifest = os.path.join(config.dataset.data_dir, "train", "manifest.json")
     val_manifest   = os.path.join(config.dataset.data_dir, "val",   "manifest.json")
 
-    # Build dataset config with all keys the dataset actually reads.
-    # model.image_tokenizer comes from the autoencoder config — it defines
-    # the image_size and patch_size the encoder expects, so we must match it.
     dataset_config = ml_collections.ConfigDict({
         "training": {
             "dataset_name":      config.dataset.dataset_name,
@@ -662,25 +659,21 @@ def load_data(config: ml_collections.ConfigDict, ae_config: ml_collections.Confi
             "pose_norm":         "lvsm_mean",
             "scene_scale_factor": 1.35,
             "square_crop":       False,
-            "rot_aug":           False,      # ovs.Dataset rejects rot_aug=True
+            "rot_aug":           False,
             "rot_aug_so3":       False,
             "target_has_input":  False,
         },
-        # Taken directly from the autoencoder config so image sizes match exactly
         "model": {
             "image_tokenizer": {
-                "image_size": ae_config.model.image_tokenizer.image_size,   # 128
-                "patch_size": ae_config.model.image_tokenizer.patch_size,   # 8
+                "image_size": ae_config.model.image_tokenizer.image_size,
+                "patch_size": ae_config.model.image_tokenizer.patch_size,
             }
         },
-        "inference": {
-            "if_inference": False,
-        },
+        "inference": {"if_inference": False},
     })
 
     train_set = DatasetClass(dataset_config)
 
-    # Val uses identical config but points at val manifest
     val_config = ml_collections.ConfigDict(dataset_config.to_dict())
     val_config.training.dataset_path = val_manifest
     val_set = DatasetClass(val_config)
@@ -690,6 +683,13 @@ def load_data(config: ml_collections.ConfigDict, ae_config: ml_collections.Confi
         train_set = torch.utils.data.Subset(
             train_set, torch.randperm(len(train_set))[:subset_len]
         )
+
+    # repeats_per_epoch: wrap train_set so each scene appears N times per epoch
+    # with different random view subsets each time (view augmentation)
+    repeats = config.dataset.get("repeats_per_epoch", 1)
+    if repeats > 1:
+        train_set = RepeatedDataset(train_set, repeats)
+        print(f"[data] repeats_per_epoch={repeats} → {len(train_set)} items/epoch")
 
     train_loader = DataLoader(
         train_set,
@@ -714,40 +714,44 @@ def load_data(config: ml_collections.ConfigDict, ae_config: ml_collections.Confi
 
 def main(config: ml_collections.ConfigDict) -> None:
     print_config(config, "NVS Flow Matching Configuration")
-    torch.set_float32_matmul_precision(
-        config.system.get("float32_matmul_precision", "high")
-    )
+    torch.set_float32_matmul_precision(config.system.get("float32_matmul_precision", "high"))
     pl.seed_everything(config.seed)
 
-    # --- Load frozen autoencoder ---
-    # We need the autoencoder's own config to build it correctly,
-    # then load the checkpoint weights.
-    ae_ckpt_dir = config.autoencoder.checkpoint_dir
+    # Load frozen autoencoder
+    ae_ckpt_dir    = config.autoencoder.checkpoint_dir
     ae_config_path = os.path.join(ae_ckpt_dir, "config.yaml")
-    ae_config = load_with_defaults(dataset_config=ae_config_path, cli_args=[])
-    autoencoder = PlatonicAutoencoder(ae_config)
+    ae_config      = load_with_defaults(dataset_config=ae_config_path, cli_args=[])
+    autoencoder    = PlatonicAutoencoder(ae_config)
     autoencoder.load_ckpt(ae_ckpt_dir)
     autoencoder.eval()
     print(f"Loaded autoencoder from {ae_ckpt_dir}")
 
-    # --- Data ---
+    # Data
     train_loader, val_loader = load_data(config, ae_config)
 
-    # --- Model ---
-    model = NVSFMModel(config, autoencoder)
-    # give model access to val dataset for camera-based rendering in on_validation_epoch_end
-    model.set_val_dataset(val_loader.dataset)
+    # Normaliser (optional)
+    norm_passes = config.dataset.get("norm_passes", 0)
+    normaliser  = None
+    if norm_passes > 0:
+        normaliser = fit_normaliser(
+            autoencoder, train_loader,
+            n_passes=norm_passes,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
 
-    # --- Trainer setup ---
-    if config.system.gpus > 0 and torch.cuda.is_available():
-        accelerator, devices = "gpu", config.system.gpus
-    else:
-        accelerator, devices = "cpu", "auto"
+    # Model
+    model = NVSFMModel(config, autoencoder)
+    if normaliser is not None:
+        model.set_normaliser(normaliser)
+    model.set_val_dataset(val_loader.dataset)
+    model.set_train_loader(train_loader)   # for copy_ratio cache
+
+    # Trainer
+    accelerator = "gpu" if config.system.gpus > 0 and torch.cuda.is_available() else "cpu"
+    devices     = config.system.gpus if accelerator == "gpu" else "auto"
 
     if config.logging.enabled:
-        save_dir = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "logs"
-        )
+        save_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "logs")
         logger = pl.loggers.WandbLogger(
             project=config.logging.project_name,
             entity=config.logging.get("wandb_identity", None),
@@ -759,8 +763,8 @@ def main(config: ml_collections.ConfigDict) -> None:
 
     callbacks = [
         pl.callbacks.ModelCheckpoint(
-            monitor=config.checkpoint.monitor,   # "val/loss"
-            mode=config.checkpoint.mode,         # "min"
+            monitor=config.checkpoint.monitor,
+            mode=config.checkpoint.mode,
             every_n_epochs=config.training.validation_frequency,
             save_last=config.checkpoint.save_last,
         ),
@@ -772,9 +776,7 @@ def main(config: ml_collections.ConfigDict) -> None:
             warmup_steps=config.training.get("ema_warmup_steps", 2000),
         ))
     if config.logging.enabled:
-        callbacks.append(
-            pl.callbacks.LearningRateMonitor(logging_interval="epoch")
-        )
+        callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval="epoch"))
 
     trainer = pl.Trainer(
         logger=logger,
@@ -788,8 +790,7 @@ def main(config: ml_collections.ConfigDict) -> None:
         check_val_every_n_epoch=config.training.check_val_every_n_epoch,
     )
 
-    # --- Train or test ---
-    test_ckpt = config.testing.get("test_ckpt", None)
+    test_ckpt   = config.testing.get("test_ckpt", None)
     resume_ckpt = config.testing.get("resume_ckpt", None)
 
     if test_ckpt is None:
