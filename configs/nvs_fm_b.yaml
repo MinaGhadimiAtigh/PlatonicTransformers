@@ -9,7 +9,8 @@ dataset:
   dataset_name: psplat.data.ovs.Dataset
   data_dir: /media/mina/hdd/amlab/nvsm/gravity512v16_dense
   dataset_fraction: 1.0
-  norm_passes: 0
+  norm_passes: 1
+  normaliser_path: /media/mina/hdd/amlab/nvsm/latent_normaliser_ae20k.pt
   repeats_per_epoch: 4              # each scene encoded 4x per epoch with different random views
 
 model:
@@ -64,7 +65,7 @@ training:
   copy_ratio_quantile: 0.05        # threshold for copy detection (5th percentile of pairwise train distances)
 
 optimizer:
-  lr: 2.0e-4
+  lr: 1.0e-4          # lower than Option A — larger model needs smaller LR
   weight_decay: 1.0e-4
 
 scheduler:

@@ -9,7 +9,8 @@ dataset:
   dataset_name: psplat.data.ovs.Dataset
   data_dir: /media/mina/hdd/amlab/nvsm/gravity512v16_dense
   dataset_fraction: 1.0
-  norm_passes: 0                    # 0=disabled, N=fit normaliser over N passes
+  norm_passes: 1                    # 0=disabled, N=fit normaliser over N passes
+  normaliser_path: /media/mina/hdd/amlab/nvsm/latent_normaliser_ae20k.pt
   repeats_per_epoch: 4              # each scene encoded 4x per epoch with different random views
 
 model:
