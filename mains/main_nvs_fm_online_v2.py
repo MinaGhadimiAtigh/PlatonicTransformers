@@ -417,12 +417,13 @@ class NVSFMModel(pl.LightningModule):
 
         vx, vp = self._velocity(x_t, pos_t, t)
         weight = self._edm_weight(t_)
-        loss = (
-            (weight * (vx - (x1 - x0)).square()).mean()
-          + (weight * (vp - (pos1 - pos0)).square()).mean()
-        )
+        loss_feat = (weight * (vx - (x1 - x0)).square()).mean()
+        loss_pos  = (weight * (vp - (pos1 - pos0)).square()).mean()
+        loss = loss_feat + loss_pos
 
         self.log("train/loss", loss, on_step=True, on_epoch=True, logger=True, batch_size=B)
+        self.log("train/loss_feat", loss_feat, on_step=True, on_epoch=True, logger=True, batch_size=B)
+        self.log("train/loss_pos", loss_pos, on_step=True, on_epoch=True, logger=True, batch_size=B)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -435,11 +436,12 @@ class NVSFMModel(pl.LightningModule):
         pos_t = (1 - t_) * pos0 + t_ * pos1
         vx, vp = self._velocity(x_t, pos_t, t)
         weight = self._edm_weight(t_)
-        loss = (
-            (weight * (vx - (x1 - x0)).square()).mean()
-          + (weight * (vp - (pos1 - pos0)).square()).mean()
-        )
+        loss_feat = (weight * (vx - (x1 - x0)).square()).mean()
+        loss_pos  = (weight * (vp - (pos1 - pos0)).square()).mean()
+        loss = loss_feat + loss_pos
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True, batch_size=B)
+        self.log("val/loss_feat", loss_feat, on_step=False, on_epoch=True, logger=True, batch_size=B)
+        self.log("val/loss_pos", loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
         return loss
 
     # -----------------------------------------------------------------------
