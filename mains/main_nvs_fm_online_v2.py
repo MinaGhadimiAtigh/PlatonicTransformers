@@ -244,6 +244,19 @@ def compute_copy_ratio(gen_feats, train_feats, threshold_quantile: float = 0.05)
     return {"val/mean_nn_dist": mean_nn_dist, "val/copy_ratio": copy_ratio}
 
 
+@torch.no_grad()
+def mean_nn_distance(query_feats, ref_feats):
+    """Mean over queries of the distance to the nearest reference, on mean-pooled z_feat.
+
+    Same distance as compute_copy_ratio. Used for real validation latents against the training
+    latents, as a reference for the generated scenes' val/mean_nn_dist.
+    Args: query_feats (Q, N, F), ref_feats (R, N, F).
+    """
+    q = query_feats.mean(dim=1).float()
+    r = ref_feats.mean(dim=1).float()
+    return torch.cdist(q, r).min(dim=1).values.mean().item()
+
+
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -311,6 +324,7 @@ class NVSFMModel(pl.LightningModule):
 
         # Cache of training latents for copy_ratio — built lazily
         self._train_feats_cache = None
+        self._val_feats_cache = None
 
     # -----------------------------------------------------------------------
     # Setup helpers
@@ -327,6 +341,10 @@ class NVSFMModel(pl.LightningModule):
     def set_train_loader(self, train_loader):
         """Store train loader so we can encode all training scenes for copy_ratio."""
         self._train_loader = train_loader
+
+    def set_val_loader(self, val_loader):
+        """Store val loader so we can encode real validation scenes as a distance reference."""
+        self._val_loader = val_loader
 
     # The normaliser is not a parameter or buffer, so store it in the checkpoint explicitly.
     # Without it a checkpoint cannot turn generated latents back into the decoder's space.
@@ -454,11 +472,15 @@ class NVSFMModel(pl.LightningModule):
         Uses the stored train_loader. Runs under no_grad, frozen encoder.
         Returns (T, n_tokens, scalar_dim) tensor on CPU.
         """
-        if not hasattr(self, "_train_loader") or self._train_loader is None:
+        return self._build_feats_cache(getattr(self, "_train_loader", None), device, "training")
+
+    def _build_feats_cache(self, loader, device, label):
+        """Same as above for any loader (training or validation). (T, n_tokens, scalar_dim) on CPU."""
+        if loader is None:
             return None
-        print("[copy_ratio] encoding training set for cache...")
+        print(f"[copy_ratio] encoding {label} set for cache...")
         all_feats = []
-        for batch in self._train_loader:
+        for batch in loader:
             batch_d = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             with torch.no_grad():
                 input, _ = self.autoencoder.process_data(
@@ -467,7 +489,7 @@ class NVSFMModel(pl.LightningModule):
                 z_feat, _, _ = self.autoencoder.encode(input)
             all_feats.append(z_feat.cpu())
         cache = torch.cat(all_feats, dim=0)  # (T, N, F)
-        print(f"[copy_ratio] cached {cache.shape[0]} training scenes")
+        print(f"[copy_ratio] cached {cache.shape[0]} {label} scenes")
         return cache
 
     def on_validation_epoch_end(self):
@@ -493,30 +515,59 @@ class NVSFMModel(pl.LightningModule):
             image_h_w = (128, 128)
 
             # --- sample generated latents ---
-            z_gen, pos_gen = self.sample(n_scenes, sampler=sampler)
+            # Sample more scenes than we render, so the statistics and distances below are less coarse.
+            n_stat = 16
+            z_all, pos_all = self.sample(n_stat, sampler=sampler)
+            z_gen, pos_gen = z_all[:n_scenes], pos_all[:n_scenes]
 
-            # --- copy_ratio: build training cache once per run ---
+            # --- statistics of the generated latents, in the flow's own (model) space. With the
+            #     normaliser on and a well-trained flow: feat mean ~0, feat std ~1, pos rms ~1,
+            #     pos mean ~0. Large deviations mean the samples are off the training distribution. ---
+            pos_c = pos_all - pos_all.mean(dim=(0, 1), keepdim=True)
+            gen_stats = {
+                "val/gen_feat_mean":    z_all.mean().item(),
+                "val/gen_feat_std":     z_all.std().item(),
+                "val/gen_pos_rms":      pos_c.pow(2).mean().sqrt().item(),
+                "val/gen_pos_mean_abs": pos_all.mean(dim=(0, 1)).abs().mean().item(),
+                "trainer/global_step":  self.global_step,
+            }
+            logger.experiment.log(gen_stats)
+            print(f"[gen latents] epoch {self.current_epoch} | "
+                  f"feat mean={gen_stats['val/gen_feat_mean']:+.3f} std={gen_stats['val/gen_feat_std']:.3f} | "
+                  f"pos rms={gen_stats['val/gen_pos_rms']:.3f} mean_abs={gen_stats['val/gen_pos_mean_abs']:.3f}")
+
+            # --- copy_ratio / nearest-neighbour distance: build the caches once per run ---
             if self._train_feats_cache is None:
                 self._train_feats_cache = self._build_train_feats_cache(device)
+            if self._val_feats_cache is None:
+                self._val_feats_cache = self._build_feats_cache(
+                    getattr(self, "_val_loader", None), device, "validation")
 
             if self._train_feats_cache is not None:
-                # The cache holds raw AE features, so compare in raw AE space.
-                z_cmp = z_gen
+                # The caches hold raw AE features, so compare in raw AE space.
+                z_cmp = z_all
                 if self.normaliser is not None:
-                    _, z_cmp = self.normaliser.denormalise(pos_gen, z_gen)
+                    _, z_cmp = self.normaliser.denormalise(pos_all, z_all)
                 cr = compute_copy_ratio(
                     z_cmp.cpu(),
                     self._train_feats_cache,
                     threshold_quantile=self.config.training.get("copy_ratio_quantile", 0.05),
                 )
-                logger.experiment.log({
+                nn_log = {
                     "val/mean_nn_dist": cr["val/mean_nn_dist"],
                     "val/copy_ratio":   cr["val/copy_ratio"],
                     "trainer/global_step": self.global_step,
-                })
-                print(f"[copy_ratio] epoch {self.current_epoch} | "
-                      f"mean_nn_dist={cr['val/mean_nn_dist']:.4f} | "
-                      f"copy_ratio={cr['val/copy_ratio']:.3f}")
+                }
+                msg = (f"[copy_ratio] epoch {self.current_epoch} | "
+                       f"mean_nn_dist={cr['val/mean_nn_dist']:.4f} | "
+                       f"copy_ratio={cr['val/copy_ratio']:.3f}")
+                if self._val_feats_cache is not None:
+                    # Reference: how far REAL validation scenes are from the training scenes.
+                    ref = mean_nn_distance(self._val_feats_cache, self._train_feats_cache)
+                    nn_log["val/real_mean_nn_dist"] = ref
+                    msg += f" | real_val_mean_nn_dist={ref:.4f}"
+                logger.experiment.log(nn_log)
+                print(msg)
 
             # --- render images ---
             generated_panels = []
@@ -839,6 +890,7 @@ def main(config: ml_collections.ConfigDict) -> None:
         model.set_normaliser(normaliser)
     model.set_val_dataset(val_loader.dataset)
     model.set_train_loader(train_loader)   # for copy_ratio cache
+    model.set_val_loader(val_loader)       # for the real-validation distance reference
 
     # Trainer
     accelerator = "gpu" if config.system.gpus > 0 and torch.cuda.is_available() else "cpu"
