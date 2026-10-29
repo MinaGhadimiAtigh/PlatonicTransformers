@@ -12,6 +12,8 @@ dataset:
   norm_passes: 1
   normaliser_path: /media/mina/hdd/amlab/nvsm/latent_normaliser_ae20k.pt
   repeats_per_epoch: 4              # each scene encoded 4x per epoch with different random views
+  feat_loss_weight: 1.0
+  pos_loss_weight: 1.0
 
 model:
   name: "platoformer"

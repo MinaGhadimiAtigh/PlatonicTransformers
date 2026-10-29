@@ -63,6 +63,8 @@ training:
   ema_decay: 0.999
   ema_warmup_steps: 2000
   copy_ratio_quantile: 0.05        # threshold for copy detection (5th percentile of pairwise train distances)
+  feat_loss_weight: 1.0
+  pos_loss_weight: 1.0
 
 optimizer:
   name: "adamw"

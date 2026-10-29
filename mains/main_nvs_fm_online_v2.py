@@ -322,6 +322,15 @@ class NVSFMModel(pl.LightningModule):
         self.normaliser = None
         self.val_dataset = None
 
+        # Relative weights of the two loss terms. Each term is a mean over its own elements, so by default
+        # one position coordinate counts 384/3 = 128 times as much as one feature channel. 1.0 / 1.0 is the
+        # unchanged sum. Only the feature weight is meant to be tuned; keep pos_loss_weight at 1.0.
+        self.feat_loss_weight = float(config.training.get("feat_loss_weight", 1.0))
+        self.pos_loss_weight  = float(config.training.get("pos_loss_weight", 1.0))
+        if self.feat_loss_weight < 0 or self.pos_loss_weight < 0:
+            raise ValueError("feat_loss_weight and pos_loss_weight must be >= 0")
+        print(f"[NVSFMModel] loss weights: feat={self.feat_loss_weight:g}  pos={self.pos_loss_weight:g}")
+
         # Cache of training latents for copy_ratio — built lazily
         self._train_feats_cache = None
         self._val_feats_cache = None
@@ -437,9 +446,12 @@ class NVSFMModel(pl.LightningModule):
         weight = self._edm_weight(t_)
         loss_feat = (weight * (vx - (x1 - x0)).square()).mean()
         loss_pos  = (weight * (vp - (pos1 - pos0)).square()).mean()
-        loss = loss_feat + loss_pos
+        loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
 
+        # train/loss is the weighted sum that is optimised; the *_feat / *_pos terms and
+        # loss_unweighted are the plain values, comparable across runs with different weights.
         self.log("train/loss", loss, on_step=True, on_epoch=True, logger=True, batch_size=B)
+        self.log("train/loss_unweighted", loss_feat + loss_pos, on_step=True, on_epoch=True, logger=True, batch_size=B)
         self.log("train/loss_feat", loss_feat, on_step=True, on_epoch=True, logger=True, batch_size=B)
         self.log("train/loss_pos", loss_pos, on_step=True, on_epoch=True, logger=True, batch_size=B)
         return loss
@@ -456,8 +468,10 @@ class NVSFMModel(pl.LightningModule):
         weight = self._edm_weight(t_)
         loss_feat = (weight * (vx - (x1 - x0)).square()).mean()
         loss_pos  = (weight * (vp - (pos1 - pos0)).square()).mean()
-        loss = loss_feat + loss_pos
+        loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
+        # val/loss (the checkpoint monitor) is the weighted sum; compare runs with val/loss_unweighted.
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True, batch_size=B)
+        self.log("val/loss_unweighted", loss_feat + loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_feat", loss_feat, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_pos", loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
         return loss
