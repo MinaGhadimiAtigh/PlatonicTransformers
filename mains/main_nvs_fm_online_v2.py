@@ -15,6 +15,9 @@ Key differences from QM9FMModel:
   - optional fixed global latent normaliser (dataset.norm_passes > 0): per-channel feature
     standardisation and per-axis position centring with ONE scalar position scale; statistics
     are fitted once (optionally cached in dataset.normaliser_path) and saved in the checkpoint
+  - optional x-prediction for the features (diffusion.feat_prediction: x). The default, edm, is
+    the previous behaviour, unchanged. Positions always keep the EDM parametrisation. See the
+    comment in NVSFMModel.__init__ and the YAML keys diffusion.xpred_loss_floor / xpred_sample_floor.
 """
 
 import os
@@ -331,6 +334,28 @@ class NVSFMModel(pl.LightningModule):
             raise ValueError("feat_loss_weight and pos_loss_weight must be >= 0")
         print(f"[NVSFMModel] loss weights: feat={self.feat_loss_weight:g}  pos={self.pos_loss_weight:g}")
 
+        # How the network output is turned into the FEATURE velocity (positions always use EDM).
+        #   "edm" (default, the previous behaviour): v = c_skip * x_t + c_out * F, EDM preconditioning.
+        #   "x": the network outputs the clean features x_hat directly (no skip term) and
+        #        v = (x_hat - x_t) / (1 - t). Same network, same sampler, same loss up to weighting.
+        #        The network input is still scaled by c_in = 1/sqrt(t^2 + (1-t)^2) (between 1 and 1.41) as in
+        #        "edm" mode; JiT feeds the raw x_t. The toy tests used this scaling.
+        # xpred_loss_floor: in "x" mode the loss on x_hat is edm_weight / max(1 - t, floor)^2 * (x_hat - x1)^2.
+        #   For t < 1 - floor this is exactly the old weighted velocity loss. A small floor (0.05) makes the
+        #   weight very large at low noise (up to 400x); 0.3 caps it; 1.0 is close to a plain x-loss.
+        # xpred_sample_floor: floor on (1 - t) when x_hat is converted to a velocity for SAMPLING only.
+        #   Keep it tiny so the last Euler step lands on x_hat (your sampler ends at t = 1 - 1/num_steps).
+        self.feat_prediction    = str(config.diffusion.get("feat_prediction", "edm")).lower()
+        self.xpred_loss_floor   = float(config.diffusion.get("xpred_loss_floor", 0.3))
+        self.xpred_sample_floor = float(config.diffusion.get("xpred_sample_floor", 1e-3))
+        if self.feat_prediction not in ("edm", "x"):
+            raise ValueError(f"diffusion.feat_prediction must be 'edm' or 'x', got '{self.feat_prediction}'")
+        if not (0.0 < self.xpred_loss_floor <= 1.0) or not (0.0 < self.xpred_sample_floor <= 0.5):
+            raise ValueError("xpred_loss_floor must be in (0, 1] and xpred_sample_floor in (0, 0.5]")
+        print(f"[NVSFMModel] feature prediction: {self.feat_prediction}"
+              + (f"  (loss floor {self.xpred_loss_floor:g}, sampling floor {self.xpred_sample_floor:g})"
+                 if self.feat_prediction == "x" else ""))
+
         # Cache of training latents for copy_ratio — built lazily
         self._train_feats_cache = None
         self._val_feats_cache = None
@@ -360,8 +385,17 @@ class NVSFMModel(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         if self.normaliser is not None:
             checkpoint["latent_normaliser"] = self.normaliser.state_dict()
+        checkpoint["feat_prediction"] = self.feat_prediction
 
     def on_load_checkpoint(self, checkpoint):
+        # Checkpoints from before this option have no key and were trained with "edm". Loading weights with
+        # the wrong output parametrisation would run without error and give garbage, so refuse.
+        saved_mode = checkpoint.get("feat_prediction", "edm")
+        if saved_mode != self.feat_prediction:
+            raise ValueError(
+                f"This checkpoint was trained with diffusion.feat_prediction='{saved_mode}' but the config "
+                f"says '{self.feat_prediction}'. Set diffusion.feat_prediction: {saved_mode} to load it."
+            )
         saved = checkpoint.get("latent_normaliser")
         if saved is not None:
             self.normaliser = LatentNormaliser.from_state_dict(saved)
@@ -385,7 +419,9 @@ class NVSFMModel(pl.LightningModule):
         sigma_data = self.config.diffusion.sigma_data
         return (t ** 2 * sigma_data ** 2 + (1 - t) ** 2) / sigma_data ** 2
 
-    def _velocity(self, x_t, pos_t, t):
+    def _forward_net(self, x_t, pos_t, t):
+        """Run the network. Returns the raw feature output, the raw position output and the EDM
+        coefficients c_skip, c_out (shape [B, 1, 1])."""
         sigma_data = self.config.diffusion.sigma_data
         t_ = t[:, None, None]
         denom   = t_ ** 2 * sigma_data ** 2 + (1 - t_) ** 2
@@ -402,10 +438,47 @@ class NVSFMModel(pl.LightningModule):
             scalar_in, pos_in, batch=None,
             avg_num_nodes=self.config.diffusion.avg_num_nodes,
         )
+        return scalar_out, vector_out.squeeze(-2), c_skip, c_out
 
-        v_x   = c_skip * x_t   + c_out * scalar_out
-        v_pos = c_skip * pos_t + c_out * vector_out.squeeze(-2)
+    def _velocity(self, x_t, pos_t, t):
+        scalar_out, vector_out, c_skip, c_out = self._forward_net(x_t, pos_t, t)
+        t_ = t[:, None, None]
+        if self.feat_prediction == "x":
+            # the network output IS the clean-feature estimate x_hat
+            v_x = (scalar_out - x_t) / (1 - t_).clamp_min(self.xpred_sample_floor)
+        else:
+            v_x = c_skip * x_t + c_out * scalar_out
+        v_pos = c_skip * pos_t + c_out * vector_out
         return v_x, v_pos
+
+    def _flow_losses(self, x1, pos1, x0, pos0, t):
+        """Weighted feature and position losses, and the plain feature MSE of the clean estimate.
+
+        edm mode: identical to the previous code (EDM-weighted velocity error).
+        x mode:   features use edm_weight / max(1 - t, xpred_loss_floor)^2 * (x_hat - x1)^2, which equals the
+                  EDM-weighted velocity error for t < 1 - floor. Positions are unchanged.
+        feat_xhat_mse is (x_hat - x1)^2 averaged, with x_hat = x_t + (1 - t) v in edm mode, so it can be
+        compared across the two modes."""
+        t_ = t[:, None, None]
+        x_t   = (1 - t_) * x0   + t_ * x1
+        pos_t = (1 - t_) * pos0 + t_ * pos1
+
+        scalar_out, vector_out, c_skip, c_out = self._forward_net(x_t, pos_t, t)
+        weight = self._edm_weight(t_)
+
+        v_pos     = c_skip * pos_t + c_out * vector_out
+        loss_pos  = (weight * (v_pos - (pos1 - pos0)).square()).mean()
+        if self.feat_prediction == "x":
+            x_hat     = scalar_out
+            w_x       = weight / (1 - t_).clamp_min(self.xpred_loss_floor).square()
+            loss_feat = (w_x * (x_hat - x1).square()).mean()
+        else:
+            v_x       = c_skip * x_t + c_out * scalar_out
+            loss_feat = (weight * (v_x - (x1 - x0)).square()).mean()
+            x_hat     = x_t + (1 - t_) * v_x
+        feat_xhat_mse = (x_hat - x1).square().mean().detach()
+        return loss_feat, loss_pos, feat_xhat_mse
+
 
     # -----------------------------------------------------------------------
     # Encode
@@ -436,16 +509,10 @@ class NVSFMModel(pl.LightningModule):
             pos1 = torch.einsum("ij,bnj->bni", rot, pos1)
 
         t   = self._sample_t(B, x1.device)
-        t_  = t[:, None, None]
         x0  = torch.randn_like(x1)
         pos0 = torch.randn_like(pos1)
-        x_t   = (1 - t_) * x0   + t_ * x1
-        pos_t = (1 - t_) * pos0 + t_ * pos1
 
-        vx, vp = self._velocity(x_t, pos_t, t)
-        weight = self._edm_weight(t_)
-        loss_feat = (weight * (vx - (x1 - x0)).square()).mean()
-        loss_pos  = (weight * (vp - (pos1 - pos0)).square()).mean()
+        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t)
         loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
 
         # train/loss is the weighted sum that is optimised; the *_feat / *_pos terms and
@@ -454,26 +521,22 @@ class NVSFMModel(pl.LightningModule):
         self.log("train/loss_unweighted", loss_feat + loss_pos, on_step=True, on_epoch=True, logger=True, batch_size=B)
         self.log("train/loss_feat", loss_feat, on_step=True, on_epoch=True, logger=True, batch_size=B)
         self.log("train/loss_pos", loss_pos, on_step=True, on_epoch=True, logger=True, batch_size=B)
+        self.log("train/feat_xhat_mse", feat_xhat_mse, on_step=True, on_epoch=True, logger=True, batch_size=B)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x1, pos1 = self._encode(batch)
         B = x1.shape[0]
         t  = self._sample_t(B, x1.device)
-        t_ = t[:, None, None]
         x0, pos0 = torch.randn_like(x1), torch.randn_like(pos1)
-        x_t   = (1 - t_) * x0   + t_ * x1
-        pos_t = (1 - t_) * pos0 + t_ * pos1
-        vx, vp = self._velocity(x_t, pos_t, t)
-        weight = self._edm_weight(t_)
-        loss_feat = (weight * (vx - (x1 - x0)).square()).mean()
-        loss_pos  = (weight * (vp - (pos1 - pos0)).square()).mean()
+        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t)
         loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
         # val/loss (the checkpoint monitor) is the weighted sum; compare runs with val/loss_unweighted.
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_unweighted", loss_feat + loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_feat", loss_feat, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_pos", loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
+        self.log("val/feat_xhat_mse", feat_xhat_mse, on_step=False, on_epoch=True, logger=True, batch_size=B)
         return loss
 
     # -----------------------------------------------------------------------
