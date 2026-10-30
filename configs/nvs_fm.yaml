@@ -56,7 +56,7 @@ training:
   epochs: 500
   batch_size: 16
   gradient_clip_val: 0.5
-  train_augm: true
+  train_augm: false
   validation_frequency: 10
   check_val_every_n_epoch: 1
   ema_enabled: true
