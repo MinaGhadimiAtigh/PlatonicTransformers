@@ -18,9 +18,15 @@ Key differences from QM9FMModel:
   - optional x-prediction for the features (diffusion.feat_prediction: x). The default, edm, is
     the previous behaviour, unchanged. Positions always keep the EDM parametrisation. See the
     comment in NVSFMModel.__init__ and the YAML keys diffusion.xpred_loss_floor / xpred_sample_floor.
+  - monitoring logged to W&B (no effect on training): val/ratio_feat_sig* and val/ratio_pos_sig* (velocity error at
+    fixed noise levels divided by the no-structure baseline, every validation_frequency epochs),
+    val/gen_var_ratio_* and val/real_var_ratio_* (variance of generated / real validation latents in groups of
+    PCA directions of the real training latents; 1.0 is ideal), and a checkpoint every
+    checkpoint.snapshot_every_n_epochs epochs (default 50, 0 = off).
 """
 
 import os
+import math
 import sys
 
 import ml_collections
@@ -284,13 +290,19 @@ class NVSFMModel(pl.LightningModule):
         ae_group       = PLATONIC_GROUPS[ae_group_name]
         self.scalar_dim = int(ae_cfg.model.transformer.d) // ae_group.G
 
+        # Time coupling of positions and features (see the long comment below, next to feat_prediction).
+        self.time_coupling = str(config.diffusion.get("time_coupling", "joint")).lower()
+        if self.time_coupling not in ("joint", "decoupled"):
+            raise ValueError(f"diffusion.time_coupling must be 'joint' or 'decoupled', got '{self.time_coupling}'")
+        self._n_noise_inputs = 2 if self.time_coupling == "decoupled" else 1
+
         # Flow matching network
         solid_name = config.model.solid_name.lower()
         if solid_name not in PLATONIC_GROUPS:
             raise ValueError(f"Unsupported solid_name '{solid_name}'")
 
         self.net = PlatonicTransformer(
-            input_dim=self.scalar_dim + 1,
+            input_dim=self.scalar_dim + self._n_noise_inputs,
             input_dim_vec=0,
             hidden_dim=config.model.hidden_dim,
             output_dim=self.scalar_dim,
@@ -356,9 +368,40 @@ class NVSFMModel(pl.LightningModule):
               + (f"  (loss floor {self.xpred_loss_floor:g}, sampling floor {self.xpred_sample_floor:g})"
                  if self.feat_prediction == "x" else ""))
 
+        # Separate noise levels for positions and features.
+        #   "joint" (default, the previous behaviour): one time t for both, the network sees one noise input.
+        #   "decoupled": features keep their own time t_f (same distribution as before); positions get their own
+        #        time t_p, and the network sees both noise levels (two noise inputs, so a new network, not loadable
+        #        from a "joint" checkpoint). Motivation: in real latents tokens from different input views sit at the
+        #        same 3D places and share features; generated latents lack this. If positions are settled first, the
+        #        feature denoiser can see where the tokens are while the objects are composed (La-Proteina uses
+        #        separate times for coordinates and latents, TRELLIS generates structure first).
+        # Training: log-sigma of positions and features are standard-normal draws with correlation pos_time_corr, each
+        #   with the same marginal as before (P_mean, P_std). With probability pos_clean_prob the positions are nearly
+        #   clean (sigma = pos_clean_sigma), because sampling spends its second half there.
+        # Sampling: features use the usual uniform-t grid, positions run pos_speedup times faster (t_p = pos_speedup * t),
+        #   jump to their clean estimate when t_p reaches 1 / (1 + pos_clean_sigma) and stay fixed afterwards.
+        self.pos_time_corr   = float(config.diffusion.get("pos_time_corr", 0.7))
+        self.pos_clean_prob  = float(config.diffusion.get("pos_clean_prob", 0.3))
+        self.pos_clean_sigma = float(config.diffusion.get("pos_clean_sigma", 0.02))
+        self.pos_speedup     = float(config.diffusion.get("pos_speedup", 2.0))
+        if not (-1.0 < self.pos_time_corr < 1.0) or not (0.0 <= self.pos_clean_prob <= 1.0) \
+                or self.pos_clean_sigma <= 0.0 or self.pos_speedup < 1.0:
+            raise ValueError("need -1 < pos_time_corr < 1, 0 <= pos_clean_prob <= 1, pos_clean_sigma > 0, pos_speedup >= 1")
+        self._t_clean = 1.0 / (1.0 + self.pos_clean_sigma)
+        if self.time_coupling == "decoupled":
+            if int(config.diffusion.get("fm_ode_order", 1)) != 1:
+                raise ValueError("time_coupling 'decoupled' supports fm_ode_order 1 only")
+            print(f"[NVSFMModel] time coupling: decoupled  (corr {self.pos_time_corr:g}, clean prob {self.pos_clean_prob:g}, "
+                  f"clean sigma {self.pos_clean_sigma:g}, positions {self.pos_speedup:g}x faster when sampling)")
+        else:
+            print("[NVSFMModel] time coupling: joint")
+
         # Cache of training latents for copy_ratio — built lazily
         self._train_feats_cache = None
         self._val_feats_cache = None
+        self._pca_eigvecs = None   # PCA of the real training latents (flow space), built lazily
+        self._pca_eigvals = None
 
     # -----------------------------------------------------------------------
     # Setup helpers
@@ -386,6 +429,7 @@ class NVSFMModel(pl.LightningModule):
         if self.normaliser is not None:
             checkpoint["latent_normaliser"] = self.normaliser.state_dict()
         checkpoint["feat_prediction"] = self.feat_prediction
+        checkpoint["time_coupling"] = self.time_coupling
 
     def on_load_checkpoint(self, checkpoint):
         # Checkpoints from before this option have no key and were trained with "edm". Loading weights with
@@ -395,6 +439,12 @@ class NVSFMModel(pl.LightningModule):
             raise ValueError(
                 f"This checkpoint was trained with diffusion.feat_prediction='{saved_mode}' but the config "
                 f"says '{self.feat_prediction}'. Set diffusion.feat_prediction: {saved_mode} to load it."
+            )
+        saved_coupling = checkpoint.get("time_coupling", "joint")
+        if saved_coupling != self.time_coupling:
+            raise ValueError(
+                f"This checkpoint was trained with diffusion.time_coupling='{saved_coupling}' but the config "
+                f"says '{self.time_coupling}'. Set diffusion.time_coupling: {saved_coupling} to load it."
             )
         saved = checkpoint.get("latent_normaliser")
         if saved is not None:
@@ -415,43 +465,72 @@ class NVSFMModel(pl.LightningModule):
         sigma = (rnd_normal * self.config.diffusion.P_std + self.config.diffusion.P_mean).exp()
         return 1.0 / (1.0 + sigma)
 
+    def _sample_times(self, batch_size, device):
+        """Training times (t_features, t_positions). Joint: the same t twice (same random numbers as before)."""
+        if self.time_coupling == "joint":
+            t = self._sample_t(batch_size, device)
+            return t, t
+        d = self.config.diffusion
+        z_f = torch.randn(batch_size, device=device)
+        z_p = self.pos_time_corr * z_f + math.sqrt(1.0 - self.pos_time_corr ** 2) * torch.randn(batch_size, device=device)
+        sigma_f = (z_f * d.P_std + d.P_mean).exp()
+        sigma_p = (z_p * d.P_std + d.P_mean).exp()
+        clean = torch.rand(batch_size, device=device) < self.pos_clean_prob
+        sigma_p = torch.where(clean, torch.full_like(sigma_p, self.pos_clean_sigma), sigma_p)
+        return 1.0 / (1.0 + sigma_f), 1.0 / (1.0 + sigma_p)
+
     def _edm_weight(self, t):
         sigma_data = self.config.diffusion.sigma_data
         return (t ** 2 * sigma_data ** 2 + (1 - t) ** 2) / sigma_data ** 2
 
-    def _forward_net(self, x_t, pos_t, t):
-        """Run the network. Returns the raw feature output, the raw position output and the EDM
-        coefficients c_skip, c_out (shape [B, 1, 1])."""
+    def _edm_coefs(self, t_):
         sigma_data = self.config.diffusion.sigma_data
-        t_ = t[:, None, None]
         denom   = t_ ** 2 * sigma_data ** 2 + (1 - t_) ** 2
         c_in    = 1.0 / denom.sqrt()
         c_skip  = (t_ * sigma_data ** 2 - (1 - t_)) / denom
         c_out   = sigma_data / denom.sqrt()
-        c_noise = (((1 - t_) / t_).log() / 4).expand(x_t.shape[0], x_t.shape[1], 1)
+        c_noise = ((1 - t_) / t_).log() / 4
+        return c_in, c_skip, c_out, c_noise
+
+    def _forward_net(self, x_t, pos_t, t, t_pos=None):
+        """Run the network. Returns the raw feature output, the raw position output and the EDM coefficients
+        (c_skip, c_out) for features and for positions (shape [B, 1, 1]). In "joint" mode positions use t too.
+        In "decoupled" mode t_pos (default: t) is the position time and the network gets both noise levels."""
+        decoupled = self.time_coupling == "decoupled"
+        t_  = t[:, None, None]
+        tp_ = t_ if (t_pos is None or not decoupled) else t_pos[:, None, None]
+        c_in, c_skip, c_out, c_noise = self._edm_coefs(t_)
+        if tp_ is t_:
+            c_in_p, c_skip_p, c_out_p, c_noise_p = c_in, c_skip, c_out, c_noise
+        else:
+            c_in_p, c_skip_p, c_out_p, c_noise_p = self._edm_coefs(tp_)
+        B, N = x_t.shape[0], x_t.shape[1]
+        noise_inputs = [c_noise.expand(B, N, 1)]
+        if decoupled:
+            noise_inputs.append(c_noise_p.expand(B, N, 1))
 
         x_in      = c_in * x_t
-        pos_in    = c_in * pos_t
-        scalar_in = torch.cat([x_in, c_noise], dim=-1)
+        pos_in    = c_in_p * pos_t
+        scalar_in = torch.cat([x_in] + noise_inputs, dim=-1)
 
         scalar_out, vector_out = self.net(
             scalar_in, pos_in, batch=None,
             avg_num_nodes=self.config.diffusion.avg_num_nodes,
         )
-        return scalar_out, vector_out.squeeze(-2), c_skip, c_out
+        return scalar_out, vector_out.squeeze(-2), (c_skip, c_out), (c_skip_p, c_out_p)
 
-    def _velocity(self, x_t, pos_t, t):
-        scalar_out, vector_out, c_skip, c_out = self._forward_net(x_t, pos_t, t)
+    def _velocity(self, x_t, pos_t, t, t_pos=None):
+        scalar_out, vector_out, (c_skip, c_out), (c_skip_p, c_out_p) = self._forward_net(x_t, pos_t, t, t_pos)
         t_ = t[:, None, None]
         if self.feat_prediction == "x":
             # the network output IS the clean-feature estimate x_hat
             v_x = (scalar_out - x_t) / (1 - t_).clamp_min(self.xpred_sample_floor)
         else:
             v_x = c_skip * x_t + c_out * scalar_out
-        v_pos = c_skip * pos_t + c_out * vector_out
+        v_pos = c_skip_p * pos_t + c_out_p * vector_out
         return v_x, v_pos
 
-    def _flow_losses(self, x1, pos1, x0, pos0, t):
+    def _flow_losses(self, x1, pos1, x0, pos0, t, t_pos=None):
         """Weighted feature and position losses, and the plain feature MSE of the clean estimate.
 
         edm mode: identical to the previous code (EDM-weighted velocity error).
@@ -459,15 +538,17 @@ class NVSFMModel(pl.LightningModule):
                   EDM-weighted velocity error for t < 1 - floor. Positions are unchanged.
         feat_xhat_mse is (x_hat - x1)^2 averaged, with x_hat = x_t + (1 - t) v in edm mode, so it can be
         compared across the two modes."""
-        t_ = t[:, None, None]
-        x_t   = (1 - t_) * x0   + t_ * x1
-        pos_t = (1 - t_) * pos0 + t_ * pos1
+        t_  = t[:, None, None]
+        tp_ = t_ if (t_pos is None or self.time_coupling != "decoupled") else t_pos[:, None, None]
+        x_t   = (1 - t_)  * x0   + t_  * x1
+        pos_t = (1 - tp_) * pos0 + tp_ * pos1
 
-        scalar_out, vector_out, c_skip, c_out = self._forward_net(x_t, pos_t, t)
-        weight = self._edm_weight(t_)
+        scalar_out, vector_out, (c_skip, c_out), (c_skip_p, c_out_p) = self._forward_net(x_t, pos_t, t, t_pos)
+        weight   = self._edm_weight(t_)
+        weight_p = self._edm_weight(tp_)
 
-        v_pos     = c_skip * pos_t + c_out * vector_out
-        loss_pos  = (weight * (v_pos - (pos1 - pos0)).square()).mean()
+        v_pos     = c_skip_p * pos_t + c_out_p * vector_out
+        loss_pos  = (weight_p * (v_pos - (pos1 - pos0)).square()).mean()
         if self.feat_prediction == "x":
             x_hat     = scalar_out
             w_x       = weight / (1 - t_).clamp_min(self.xpred_loss_floor).square()
@@ -478,6 +559,94 @@ class NVSFMModel(pl.LightningModule):
             x_hat     = x_t + (1 - t_) * v_x
         feat_xhat_mse = (x_hat - x1).square().mean().detach()
         return loss_feat, loss_pos, feat_xhat_mse
+
+    # -----------------------------------------------------------------------
+    # Monitoring helpers (logging only)
+    # -----------------------------------------------------------------------
+
+    _MONITOR_SIGMAS = (0.1, 0.3, 1.0, 3.0, 10.0)
+    _PCA_GROUPS = (("top16", 0, 16), ("16to64", 16, 64), ("64to128", 64, 128), ("weak128plus", 128, None))
+
+    @staticmethod
+    def _no_structure_baseline(t):
+        """Per-coordinate velocity error of the best estimator that ignores all structure (unit-variance data,
+        unit noise, unweighted). Same definition as sampler_diagnostics.py. A model that learned structure
+        comes in below it, so the ratios below are < 1 where it learned something and about 1 where it did not."""
+        return 2.0 - (2 * t - 1) ** 2 / (t ** 2 + (1 - t) ** 2)
+
+    @torch.no_grad()
+    def _noise_level_ratios(self, x1, pos1, batch_idx):
+        """Velocity error / baseline at fixed noise levels, with fixed noise so epochs are comparable."""
+        out = {}
+        gen = torch.Generator(device=x1.device)
+        gen.manual_seed(1234 + int(batch_idx))
+        B = x1.shape[0]
+        for sigma in self._MONITOR_SIGMAS:
+            t_val = 1.0 / (1.0 + sigma)
+            t  = torch.full((B,), t_val, device=x1.device, dtype=x1.dtype)
+            t_ = t[:, None, None]
+            x0   = torch.randn(x1.shape,   device=x1.device, dtype=x1.dtype, generator=gen)
+            pos0 = torch.randn(pos1.shape, device=x1.device, dtype=x1.dtype, generator=gen)
+            x_t   = (1 - t_) * x0   + t_ * x1
+            pos_t = (1 - t_) * pos0 + t_ * pos1
+            vx, vp = self._velocity(x_t, pos_t, t)
+            base = self._no_structure_baseline(torch.tensor(t_val)).item()
+            out[f"val/ratio_feat_sig{sigma:g}"] = (vx - (x1 - x0)).square().mean() / base
+            out[f"val/ratio_pos_sig{sigma:g}"]  = (vp - (pos1 - pos0)).square().mean() / base
+            if self.time_coupling == "decoupled":
+                # the situation of the second half of sampling: features at this noise level, positions nearly clean
+                tp_c  = torch.full_like(t, self._t_clean)
+                pos_c = (1 - self._t_clean) * pos0 + self._t_clean * pos1
+                vx_c, _ = self._velocity(x_t, pos_c, t, tp_c)
+                out[f"val/ratio_feat_sig{sigma:g}_posclean"] = (vx_c - (x1 - x0)).square().mean() / base
+        return out
+
+    def _to_flow_feats(self, feats):
+        """Raw AE features (..., F) to the flow's space (per-channel standardisation if a normaliser is used)."""
+        if self.normaliser is None:
+            return feats
+        _, z = self.normaliser.normalise(torch.zeros(*feats.shape[:-1], 3, device=feats.device), feats)
+        return z
+
+    @torch.no_grad()
+    def _ensure_pca(self):
+        """PCA (second-moment matrix, about 0) of the real TRAINING latents in the flow's space, from the cache
+        that copy_ratio already builds. Returns False while that cache is not available."""
+        if self._pca_eigvecs is not None:
+            return True
+        cache = self._train_feats_cache
+        if cache is None:
+            return False
+        F = cache.shape[-1]
+        C = torch.zeros(F, F, dtype=torch.float64)
+        n = 0
+        for chunk in cache.split(256):
+            z = self._to_flow_feats(chunk).reshape(-1, F).float()
+            C += (z.T @ z).double()
+            n += z.shape[0]
+        evals, evecs = torch.linalg.eigh(C / n)
+        order = evals.argsort(descending=True)
+        self._pca_eigvals = evals[order].clamp_min(1e-12).float()
+        self._pca_eigvecs = evecs[:, order].float()
+        print(f"[pca] real training latents: top-16 / 64 / 128 hold "
+              f"{100 * self._pca_eigvals[:16].sum() / self._pca_eigvals.sum():.1f}% / "
+              f"{100 * self._pca_eigvals[:64].sum() / self._pca_eigvals.sum():.1f}% / "
+              f"{100 * self._pca_eigvals[:128].sum() / self._pca_eigvals.sum():.1f}% of the variance")
+        return True
+
+    @torch.no_grad()
+    def _var_ratios(self, z_flat):
+        """Variance of z_flat (M, F, flow space) along the real PCA directions, per group, divided by the real
+        variance in that group. 1.0 is ideal; above 1 means too much energy in those directions."""
+        v   = self._pca_eigvecs.to(z_flat.device)
+        lam = self._pca_eigvals.to(z_flat.device)
+        second_moment = (z_flat.float() @ v).square().mean(0)
+        out = {}
+        for name, lo, hi in self._PCA_GROUPS:
+            if lo >= lam.numel():
+                continue
+            out[name] = (second_moment[lo:hi].sum() / lam[lo:hi].sum()).item()
+        return out
 
 
     # -----------------------------------------------------------------------
@@ -508,11 +677,11 @@ class NVSFMModel(pl.LightningModule):
             rot  = self.rotation_generator().type_as(pos1)
             pos1 = torch.einsum("ij,bnj->bni", rot, pos1)
 
-        t   = self._sample_t(B, x1.device)
+        t, t_pos = self._sample_times(B, x1.device)
         x0  = torch.randn_like(x1)
         pos0 = torch.randn_like(pos1)
 
-        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t)
+        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t, t_pos)
         loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
 
         # train/loss is the weighted sum that is optimised; the *_feat / *_pos terms and
@@ -527,9 +696,9 @@ class NVSFMModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x1, pos1 = self._encode(batch)
         B = x1.shape[0]
-        t  = self._sample_t(B, x1.device)
+        t, t_pos = self._sample_times(B, x1.device)
         x0, pos0 = torch.randn_like(x1), torch.randn_like(pos1)
-        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t)
+        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t, t_pos)
         loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
         # val/loss (the checkpoint monitor) is the weighted sum; compare runs with val/loss_unweighted.
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True, batch_size=B)
@@ -537,6 +706,11 @@ class NVSFMModel(pl.LightningModule):
         self.log("val/loss_feat", loss_feat, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_pos", loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/feat_xhat_mse", feat_xhat_mse, on_step=False, on_epoch=True, logger=True, batch_size=B)
+        # Velocity error at fixed noise levels over the no-structure baseline, on the same epochs as the
+        # generation statistics (every validation_frequency epochs); logging only.
+        if (self.current_epoch + 1) % self.config.training.validation_frequency == 0:
+            for name, value in self._noise_level_ratios(x1, pos1, batch_idx).items():
+                self.log(name, value, on_step=False, on_epoch=True, logger=True, batch_size=B)
         return loss
 
     # -----------------------------------------------------------------------
@@ -619,6 +793,25 @@ class NVSFMModel(pl.LightningModule):
             if self._val_feats_cache is None:
                 self._val_feats_cache = self._build_feats_cache(
                     getattr(self, "_val_loader", None), device, "validation")
+
+            # --- variance of the generated latents along the REAL principal directions (own try block so a
+            #     failure here cannot skip the rendering below) ---
+            try:
+                if self._ensure_pca():
+                    n_f = z_all.shape[-1]
+                    pca_log = {f"val/gen_var_ratio_{k}": v
+                               for k, v in self._var_ratios(z_all.reshape(-1, n_f)).items()}
+                    if self._val_feats_cache is not None:
+                        z_real_ref = self._to_flow_feats(self._val_feats_cache[:16]).reshape(-1, n_f).to(device)
+                        pca_log.update({f"val/real_var_ratio_{k}": v
+                                        for k, v in self._var_ratios(z_real_ref).items()})
+                    pca_log["trainer/global_step"] = self.global_step
+                    logger.experiment.log(pca_log)
+                    print("[pca] epoch {} | generated / real variance: ".format(self.current_epoch)
+                          + "  ".join(f"{k.replace('val/gen_var_ratio_', '')}={v:.2f}"
+                                      for k, v in pca_log.items() if k.startswith("val/gen_var_ratio_")))
+            except Exception as e:
+                print(f"[warn] PCA variance ratios skipped: {e}")
 
             if self._train_feats_cache is not None:
                 # The caches hold raw AE features, so compare in raw AE space.
@@ -717,6 +910,9 @@ class NVSFMModel(pl.LightningModule):
             if sampler == "fm_ode":
                 return self._sample_fm_ode(num_scenes)
             elif sampler == "edm":
+                if self.time_coupling == "decoupled":
+                    raise ValueError("The 'edm' sampler uses one time for positions and features; "
+                                     "use 'fm_ode' with time_coupling 'decoupled'.")
                 return self._sample_edm(num_scenes)
             else:
                 raise ValueError(f"Unknown sampler '{sampler}'. Choose 'fm_ode' or 'edm'.")
@@ -730,6 +926,8 @@ class NVSFMModel(pl.LightningModule):
 
         x   = torch.randn(num_scenes, self.n_tokens, self.scalar_dim, device=device)
         pos = torch.randn(num_scenes, self.n_tokens, 3, device=device)
+        if self.time_coupling == "decoupled":
+            return self._integrate_decoupled(x, pos, num_steps)
 
         eps = 1e-4
         ts  = torch.linspace(eps, 1.0, num_steps + 1, device=device)
@@ -755,6 +953,36 @@ class NVSFMModel(pl.LightningModule):
                 x   = x   + dt * 0.5 * (vx  + vx2)
                 pos = pos + dt * 0.5 * (vp  + vp2)
 
+        return x, pos
+
+    def _integrate_decoupled(self, x, pos, num_steps):
+        """Euler sampler with separate position and feature times (time_coupling 'decoupled').
+        Features follow the usual uniform grid t_f. Positions follow t_p = pos_speedup * t_f; at the step where
+        t_p would pass 1 / (1 + pos_clean_sigma) they jump to their clean estimate and stay fixed, and the network is
+        told t_p = 1 / (1 + pos_clean_sigma) from then on (the situation it saw in training with clean positions).
+        The velocity clamp of the joint sampler is kept."""
+        B      = x.shape[0]
+        device = x.device
+        eps    = 1e-4
+        ts     = torch.linspace(eps, 1.0, num_steps + 1, device=device)
+        dt     = ts[1] - ts[0]
+        t_cap  = torch.tensor(self._t_clean, device=device)
+        lam    = self.pos_speedup
+        pos_done = False
+        for i in range(num_steps):
+            t_now  = ts[i]
+            tp_now = t_cap if pos_done else torch.minimum(lam * t_now, t_cap)
+            vx, vp = self._velocity(x, pos, t_now.expand(B), tp_now.expand(B))
+            vx = vx.clamp(-10, 10)
+            vp = vp.clamp(-10, 10)
+            x = x + dt * vx
+            if not pos_done:
+                tp_next = lam * ts[i + 1]
+                if tp_next >= t_cap:
+                    pos = pos + (1 - tp_now) * vp          # land on the clean position estimate
+                    pos_done = True
+                else:
+                    pos = pos + (tp_next - tp_now) * vp
         return x, pos
 
     def _sample_edm(self, num_scenes: int):
@@ -993,6 +1221,16 @@ def main(config: ml_collections.ConfigDict) -> None:
         ),
         TimerCallback(),
     ]
+    # Extra checkpoints every N epochs (never overwritten), so a run can be inspected at several stages.
+    snapshot_every = int(config.checkpoint.get("snapshot_every_n_epochs", 50))
+    if snapshot_every > 0:
+        callbacks.append(pl.callbacks.ModelCheckpoint(
+            filename="snapshot-epoch{epoch:04d}-step{step}",
+            auto_insert_metric_name=False,
+            every_n_epochs=snapshot_every,
+            save_top_k=-1,
+            save_on_train_epoch_end=True,
+        ))
     if config.training.get("ema_enabled", False):
         callbacks.append(EMACallback(
             decay=config.training.get("ema_decay", 0.999),

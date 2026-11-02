@@ -1,0 +1,103 @@
+# NVS Flow Matching — Option B (~8M params, hidden_dim=384) + x-prediction on the features
+
+seed: 42
+
+autoencoder:
+  checkpoint_dir: /media/mina/hdd/amlab/nvsm/ae_grav_dense_dec4_v55_20k_trivial_rayinit_bias_noaug
+
+dataset:
+  dataset_name: psplat.data.ovs.Dataset
+  data_dir: /media/mina/hdd/amlab/nvsm/gravity512v16_dense
+  dataset_fraction: 1.0
+  norm_passes: 1
+  normaliser_path: /media/mina/hdd/amlab/nvsm/latent_normaliser_ae20k.pt
+  repeats_per_epoch: 4              # each scene encoded 4x per epoch with different random views
+  feat_loss_weight: 1.0
+  pos_loss_weight: 1.0
+
+model:
+  name: "platoformer"
+  hidden_dim: 384
+  num_layers: 6
+  num_heads: 12
+  solid_name: "trivial"
+  spatial_dim: 3
+  dense_mode: true
+  scalar_task_level: "node"
+  vector_task_level: "node"
+  ffn_readout: true
+  mean_aggregation: false
+  attention: true
+  dropout: 0.0
+  drop_path_rate: 0.0
+  layer_scale_init_value: null
+  ffn_dim_factor: 4
+  rope_sigma: 4.0
+  ape_sigma: null
+  learned_freqs: true
+  freq_init: "spiral"
+  use_key: false
+  rope_on_values: true
+  compile: true
+  attention_backend: "flash"
+
+diffusion:
+  sigma_data: 1.0
+  P_mean: -1.2
+  P_std: 1.2
+  avg_num_nodes: 256
+  fm_ode_order: 1
+  num_steps: 50
+  sigma_min: 0.002
+  sigma_max: 1.0
+  rho: 7.0
+  S_churn: 0.0
+  sampler: "fm_ode"
+  feat_prediction: x             # "edm" = previous behaviour, "x" = x-prediction for the features (positions stay EDM)
+  xpred_loss_floor: 0.3           # loss weight on x_hat is edm_weight / max(1-t, floor)^2
+  xpred_sample_floor: 0.001       # floor on (1-t) when converting x_hat to a velocity for sampling
+
+training:
+  epochs: 500
+  batch_size: 16
+  gradient_clip_val: 0.5
+  train_augm: false
+  validation_frequency: 10
+  check_val_every_n_epoch: 1
+  ema_enabled: true
+  ema_decay: 0.999
+  ema_warmup_steps: 2000
+  copy_ratio_quantile: 0.05        # threshold for copy detection (5th percentile of pairwise train distances)
+
+optimizer:
+  lr: 1.0e-4          # lower than Option A — larger model needs smaller LR
+  weight_decay: 1.0e-4
+
+scheduler:
+  use_cosine: true
+  T_max_epochs: null
+
+logging:
+  enabled: true
+  project_name: "Platonic-NVS-FM"
+  wandb_identity: null
+  log_every_n_steps: 50
+
+system:
+  gpus: 1
+  num_workers: 4
+  enable_progress_bar: true
+  precision: "32"
+  float32_matmul_precision: "high"
+  timer: null
+
+testing:
+  test_ckpt: null
+  resume_ckpt: null
+  metrics_out: null
+
+checkpoint:
+  monitor: "val/loss"
+  mode: "min"
+  save_last: true
+  snapshot_every_n_epochs: 50     # extra checkpoint every N epochs (0 = off)
