@@ -12,7 +12,8 @@ It loads a Lightning checkpoint (EMA weights by default, exactly what validation
 
 Add --trace (fast trajectory trace), --decoder-tolerance (how much latent noise the decoder tolerates) or --swap-test
 (do generated positions or generated features ruin the images) or --pca-test (is generated feature damage off the
-real feature subspace) to run only that part.
+real feature subspace) or --structure (numbers for crowding and for how consistent the features of nearby tokens
+are, real against generated; use --scenes 64) to run only that part.
 Add --split train to use training scenes.
 Run from the PlatonicTransformers folder (where mains/ and configs/ are), e.g.
   PYTHONPATH="/media/mina/hdd/amlab/nvsm/PlatonicTransformers:/media/mina/hdd/amlab/nvsm/PlatonicSplats${PYTHONPATH:+:$PYTHONPATH}" \
@@ -58,6 +59,9 @@ def parse_args():
                    help="Only test whether generated positions or generated features ruin the images (fast).")
     p.add_argument("--pca-test", action="store_true",
                    help="Only test whether generated feature damage lies off the real feature subspace (fast).")
+    p.add_argument("--structure", action="store_true",
+                   help="Only compare how tokens are arranged and how consistent the features of nearby tokens are, "
+                        "real against generated (numbers, no rendering). Use --scenes 64.")
     p.add_argument("--trace", action="store_true",
                    help="Only trace where the flow leaves the data distribution along sampling paths (fast).")
     return p.parse_args()
@@ -591,6 +595,11 @@ def generate_samples(model, n, steps, seed, device):
     gen = torch.Generator(device=device).manual_seed(seed)
     base_x = torch.randn(n, model.n_tokens, model.scalar_dim, device=device, generator=gen)
     base_p = torch.randn(n, model.n_tokens, 3, device=device, generator=gen)
+    if getattr(model, "time_coupling", "joint") == "decoupled":
+        # the model's own sampler: positions run ahead of features (one sampler only; the other variants
+        # assume one time for positions and features)
+        zg, pg = model._integrate_decoupled(base_x, base_p, steps)
+        return [("current: decoupled times, positions first, Euler, clamp 10", zg, pg)]
     variants = sampler_variants(steps)
     out = []
     for name, sigmas_, heun, clamp, clip in (variants[0], variants[-1]):
@@ -598,6 +607,100 @@ def generate_samples(model, n, steps, seed, device):
         zg, pg, _ = integrate(model, base_x * s0, base_p * s0, sigmas_, heun=heun, clamp=clamp, clip_x1=clip)
         out.append((name, zg, pg))
     return out
+
+
+# ----------------------------------------------------------------------------- structure test
+def structure_metrics(z, pos, slot_mean, edges, ks=(1, 5, 20), near_k=4, view_size=48):
+    """How tokens are arranged and how alike the features of nearby tokens are.
+
+    z (S, N, F) and pos (S, N, 3) in the flow's normalised space; slot_mean (1, N, F) is the per-token-slot mean of the
+    real latents (47.8% of the feature variance is fixed per slot, so it is removed before comparing features).
+    Returns per-scene arrays (to give a spread over scenes) and cosine similarity by position distance.
+      pos_nn{k}          mean distance of a token to its k-th nearest token (small = crowded or clumped)
+      feat_cos_nearest   mean cosine similarity of the slot-centred features to the near_k nearest tokens by position
+      feat_cos_random    the same to all other tokens (baseline, close to 0)
+      by_bin             mean cosine similarity of token pairs whose distance falls in the bins given by edges
+      by_bin_same_view   the same for pairs from the same input-view slot (token index // view_size, the 16 centre
+                         tokens form a sixth group), by_bin_diff_view for pairs from different slots. If real
+                         nearby tokens agree only within a view slot, the agreement is view structure, not objects.
+      near_same_frac     share of the near_k nearest tokens that belong to the same view slot
+    """
+    S, N, _ = z.shape
+    D = torch.cdist(pos.float(), pos.float())
+    eye = torch.eye(N, dtype=torch.bool, device=D.device)
+    srt, idx = D.masked_fill(eye, float("inf")).sort(dim=-1)
+    r = z.float() - slot_mean.float()
+    r = r / r.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    C = r @ r.transpose(1, 2)
+    out = {f"pos_nn{k}": srt[..., k - 1].mean(dim=-1).cpu().numpy() for k in ks}
+    out["feat_cos_nearest"] = torch.gather(C, 2, idx[..., :near_k]).mean(dim=(1, 2)).cpu().numpy()
+    out["feat_cos_random"] = (C.masked_fill(eye, 0.0).sum(dim=(1, 2)) / (N * (N - 1))).cpu().numpy()
+    grp = torch.clamp(torch.arange(N, device=D.device) // view_size, max=N // view_size)
+    same = (grp[:, None] == grp[None, :]).unsqueeze(0)
+    nb_same = grp[idx[..., :near_k]] == grp[None, :, None]
+    out["near_same_frac"] = nb_same.float().mean(dim=(1, 2)).cpu().numpy()
+    bounds = [0.0] + [float(e) for e in edges] + [float("inf")]
+    by_bin, by_same, by_diff = [], [], []
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        m = (D >= lo) & (D < hi) & ~eye
+        by_bin.append(float(C[m].mean().item()) if bool(m.any()) else float("nan"))
+        ms, md = m & same, m & ~same
+        by_same.append(float(C[ms].mean().item()) if bool(ms.any()) else float("nan"))
+        by_diff.append(float(C[md].mean().item()) if bool(md.any()) else float("nan"))
+    out["by_bin"], out["by_bin_same_view"], out["by_bin_diff_view"] = by_bin, by_same, by_diff
+    return out
+
+
+def distance_edges(pos, quantiles=(0.01, 0.05, 0.2, 0.5)):
+    """Bin edges for pair distances: quantiles of the real pairwise distances (same edges for real and generated)."""
+    D = torch.cdist(pos.float(), pos.float())
+    N = pos.shape[1]
+    vals = D[:, ~torch.eye(N, dtype=torch.bool, device=D.device)].flatten()
+    if vals.numel() > 4_000_000:
+        vals = vals[torch.randperm(vals.numel(), device=vals.device)[:4_000_000]]
+    return [float(torch.quantile(vals, q).item()) for q in quantiles]
+
+
+def _mean_sd(a):
+    return float(np.mean(a)), float(np.std(a))
+
+
+def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir):
+    slot_mean = z1.mean(dim=0, keepdim=True)
+    edges = distance_edges(pos1)
+    rows = [("real validation latents", structure_metrics(z1, pos1, slot_mean, edges))]
+    gens = {}
+    for c in range(0, n_gen, 16):
+        out = generate_samples(model, min(16, n_gen - c), steps, seed + c, device)
+        for k, (name, zg, pg) in enumerate(out):
+            gens.setdefault(k, (name, [], []))
+            gens[k][1].append(zg); gens[k][2].append(pg)
+    for name, zs, ps in gens.values():
+        rows.append((f"generated: {name}", structure_metrics(torch.cat(zs), torch.cat(ps), slot_mean, edges)))
+    keys = ["pos_nn1", "pos_nn5", "pos_nn20", "feat_cos_nearest", "feat_cos_random", "near_same_frac"]
+    print(f"\nStructure test: {len(z1)} real scenes, {n_gen} generated scenes per sampler; mean (sd over scenes).")
+    print("  Distances are in the flow's normalised space (real position rms = 1).")
+    print("  " + f"{'':52s} " + " ".join(f"{k:>17s}" for k in keys))
+    summary = {}
+    for name, m in rows:
+        cells = []
+        for k in keys:
+            mu, sd = _mean_sd(m[k]); cells.append(f"{mu:8.3f} ({sd:5.3f})")
+        print("  " + f"{name:52s} " + " ".join(f"{c:>17s}" for c in cells))
+        summary[name] = {k: {"mean": _mean_sd(m[k])[0], "sd_over_scenes": _mean_sd(m[k])[1]} for k in keys}
+        for tag in ("by_bin", "by_bin_same_view", "by_bin_diff_view"):
+            summary[name]["feat_cos_" + tag] = [None if v != v else v for v in m[tag]]
+    labels = [f"< {edges[0]:.3f}"] + [f"{edges[i]:.3f} to {edges[i + 1]:.3f}" for i in range(len(edges) - 1)] + [f">= {edges[-1]:.3f}"]
+    print("\n  Cosine similarity of slot-centred features by token-pair distance (bins = real quantiles 1%, 5%, 20%, 50%):")
+    print("  " + f"{'distance':20s} " + " ".join(f"{n[:22]:>22s}" for n, _ in rows))
+    for j, lab in enumerate(labels):
+        print("  " + f"{lab:20s} " + " ".join(f"{m['by_bin'][j]:22.3f}" for _, m in rows))
+    for tag, title in (("by_bin_same_view", "pairs from the SAME input-view slot"), ("by_bin_diff_view", "pairs from DIFFERENT input-view slots")):
+        print(f"\n  The same, only {title}:")
+        for j, lab in enumerate(labels):
+            print("  " + f"{lab:20s} " + " ".join(f"{m[tag][j]:22.3f}" for _, m in rows))
+    (out_dir / "structure_test.json").write_text(json.dumps({"edges": edges, "bin_labels": labels, "rows": summary},
+                                                            indent=2, allow_nan=False) + "\n")
 
 
 # ----------------------------------------------------------------------------- main
@@ -657,6 +760,15 @@ def main():
         raise RuntimeError(f"Checkpoint was trained with diffusion.feat_prediction='{saved_mode}' but --config "
                            f"says '{config_mode}'. Use the config the run was trained with.")
     print(f"Feature prediction mode: {config_mode}")
+    saved_coupling, config_coupling = ckpt.get("time_coupling", "joint"), getattr(model, "time_coupling", "joint")
+    if saved_coupling != config_coupling:
+        raise RuntimeError(f"Checkpoint was trained with diffusion.time_coupling='{saved_coupling}' but --config says "
+                           f"'{config_coupling}'. Use the config the run was trained with.")
+    print(f"Time coupling: {config_coupling}")
+    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance):
+        raise RuntimeError("This checkpoint uses separate times for positions and features. The default mode and --trace "
+                           "assume one time for both and are not valid for it; use --structure, --swap-test, "
+                           "--pca-test or --decoder-tolerance.")
     info = load_flow_weights(model, ckpt, args.weights, fm.LatentNormaliser)
     del ckpt
     model.to(device).eval()
@@ -701,6 +813,13 @@ def main():
             generated = generate_samples(model, len(ctx), args.steps, args.seed, device)
             run_swap_test(model, ctx, generated, z1.mean(dim=0, keepdim=True), out_dir)
             print(f"\nSaved 4_swap_test.png and swap_test.json in {out_dir}")
+            return
+
+        if args.structure:
+            out_dir = args.out_dir.expanduser().resolve() / ("structure_test_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            run_structure(model, z1, pos1, args.steps, args.seed, args.scenes, device, out_dir)
+            print(f"\nSaved structure_test.json in {out_dir}")
             return
 
         if args.pca_test:
