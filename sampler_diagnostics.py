@@ -14,7 +14,9 @@ Add --trace (fast trajectory trace), --decoder-tolerance (how much latent noise 
 (do generated positions or generated features ruin the images) or --pca-test (is generated feature damage off the
 real feature subspace) or --structure (numbers for crowding and for how consistent the features of nearby tokens
 are, real against generated; use --scenes 64) or --gen-metrics (distribution metrics on rendered views, generated
-against real; use --scenes 128) to run only that part.
+against real; use --scenes 128), --real-projection (real features projected onto K principal components),
+--ladder (noise ladder: flow against plain noise of the same size) or --structure --height-split (floor against
+object tokens) to run only that part.
 Add --split train to use training scenes.
 Run from the PlatonicTransformers folder (where mains/ and configs/ are), e.g.
   PYTHONPATH="/media/mina/hdd/amlab/nvsm/PlatonicTransformers:/media/mina/hdd/amlab/nvsm/PlatonicSplats${PYTHONPATH:+:$PYTHONPATH}" \
@@ -63,6 +65,14 @@ def parse_args():
     p.add_argument("--structure", action="store_true",
                    help="Only compare how tokens are arranged and how consistent the features of nearby tokens are, "
                         "real against generated (numbers, no rendering). Use --scenes 64.")
+    p.add_argument("--real-projection", action="store_true",
+                   help="Only test whether the decoder renders REAL features projected onto their top-K principal components "
+                        "(K 16 to 128; fitted on half of --val-scenes, tested on the other half; use --val-scenes 64).")
+    p.add_argument("--ladder", action="store_true",
+                   help="Only run the noise ladder: real latents denoised by the flow from partial noise, against real latents plus "
+                        "plain noise of the same size, distance to real views at each level (joint-time checkpoints only).")
+    p.add_argument("--height-split", action="store_true",
+                   help="With --structure: also split the structure numbers into floor tokens and object tokens by height.")
     p.add_argument("--gen-metrics", action="store_true",
                    help="Only compute distribution metrics on rendered views, generated against real (use --scenes 128 and "
                         "--val-scenes 64; run every checkpoint with the same values for a fair comparison).")
@@ -671,7 +681,7 @@ def _mean_sd(a):
     return float(np.mean(a)), float(np.std(a))
 
 
-def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir):
+def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir, height_split=False):
     slot_mean = z1.mean(dim=0, keepdim=True)
     edges = distance_edges(pos1)
     rows = [("real validation latents", structure_metrics(z1, pos1, slot_mean, edges))]
@@ -707,6 +717,8 @@ def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir):
             print("  " + f"{lab:20s} " + " ".join(f"{m[tag][j]:22.3f}" for _, m in rows))
     (out_dir / "structure_test.json").write_text(json.dumps({"edges": edges, "bin_labels": labels, "rows": summary},
                                                             indent=2, allow_nan=False) + "\n")
+    if height_split:
+        run_height_split(z1, pos1, slot_mean, [(f"generated: {name}", torch.cat(zs), torch.cat(ps)) for name, zs, ps in gens.values()], out_dir)
 
 
 
@@ -911,6 +923,214 @@ def run_gen_metrics(model, ctx, n_gen, steps, seed, device, out_dir, feature_net
     return results
 
 
+
+# ----------------------------------------------------------------------------- real-feature projection test
+def _feature_fn(device, which, ref_images):
+    """(name, fn): DINOv2 features when available, else the low-level descriptor standardised on the reference."""
+    name, deep = load_deep_features(device, which)
+    if name is not None:
+        return name, deep
+    base = lowlevel_descriptor(ref_images)
+    mu, sd_ = base.mean(0), base.std(0)
+    sd_ = torch.maximum(sd_, sd_.median().clamp(min=1e-6))
+    return "low-level descriptor (not reliable as a quality score)", lambda x: ((lowlevel_descriptor(x) - mu) / sd_).clamp(-10, 10)
+
+
+def _project(z, center, basis, k):
+    c = z - center
+    top = basis[:, :k]
+    return center + (c @ top) @ top.T
+
+
+@torch.no_grad()
+def run_real_projection(model, ctx, out_dir, ks=(16, 32, 64, 128)):
+    """Can the decoder render REAL features that were projected onto their top-K principal components?
+
+    The basis is fitted on the even-numbered real scenes and tested on the odd-numbered ones (so the test is
+    out of sample). Two variants: 'global-mean PCA' (the features as they are) and 'slot-centred PCA' (the
+    per-token-slot mean of the fit scenes is removed first and added back; 47.8% of the feature variance is
+    fixed per slot, so a flow would only have to generate the rest). Positions are untouched. PSNR is against
+    the decoder's own reconstruction of the unprojected latent; edge strength, high-frequency share and colour
+    share of the render are given as a ratio to that reconstruction (a blurred floor shows as a ratio below 1).
+    """
+    fit = [c for i, c in enumerate(ctx) if i % 2 == 0]
+    test = [c for i, c in enumerate(ctx) if i % 2 == 1]
+    zf = torch.cat([c["z"] for c in fit])
+    slot_mean = zf.mean(dim=0, keepdim=True)
+    g_mean, g_basis, g_evals = feature_pca(zf)
+    s_mean, s_basis, s_evals = feature_pca(zf - slot_mean)
+    variants = [("global-mean PCA", g_mean, g_basis, g_evals), ("slot-centred PCA", slot_mean + s_mean, s_basis, s_evals)]
+    base_stats = image_scalars(torch.cat([c["recon"] for c in test]))
+    print(f"\nReal-feature projection: basis fitted on {len(fit)} scenes, tested on {len(test)} other scenes "
+          f"({len(test) * test[0]['recon'].shape[0]} views).")
+    print("  Share of the fit features' variance in the top-k components: "
+          + ", ".join(f"{name.split()[0]} k={k}: {100 * float(ev[:k].sum() / ev.sum()):.1f}%" for name, _, _, ev in variants for k in (32, 64)))
+    print(f"  {'variant':18s} {'K':>4s} {'PSNR dB (sd over scenes)':>26s} {'feature MSE':>12s} {'edge ratio':>11s} {'high-freq ratio':>16s} {'colour ratio':>13s}")
+    results, rows = [], [("real: autoencoder reconstruction", [c["recon"] for c in test[:2]])]
+    for name, center, basis, _ in variants:
+        for k in ks[::-1]:
+            scores, mses, imgs_all = [], [], []
+            for c in test:
+                zk = _project(c["z"], center, basis, k)
+                img = model.render(zk, c["pos"], c["ray_o"], c["ray_d"], IMAGE_HW)[0]
+                scores.append(psnr(img, c["recon"])); mses.append(float((zk - c["z"]).square().mean())); imgs_all.append(img)
+            st = image_scalars(torch.cat(imgs_all))
+            ratio = {m: (float(st[m].mean() / base_stats[m].mean()) if float(base_stats[m].mean()) > 1e-6 else None) for m in st}
+            row = {"variant": name, "k": k, "psnr_mean": float(np.mean(scores)), "psnr_sd_over_scenes": float(np.std(scores)),
+                   "feature_mse": float(np.mean(mses)), "edge_ratio": ratio["edge_strength"],
+                   "high_freq_ratio": ratio["high_freq_share"], "colour_ratio": ratio["colour_share"]}
+            results.append(row)
+            print(f"  {name:18s} {k:4d} {row['psnr_mean']:18.2f} ({row['psnr_sd_over_scenes']:4.2f}) {row['feature_mse']:12.4f} "
+                  + "".join(("{:>{w}}".format("n/a", w=w) if v is None else "{:{w}.3f}".format(v, w=w)) for v, w in
+                            ((row["edge_ratio"], 11), (row["high_freq_ratio"], 16), (row["colour_ratio"], 13))))
+            rows.append((f"{name}, top {k}", imgs_all[:2]))
+    save_grid(out_dir / "7_real_projection.png", rows, label_width=330)
+    (out_dir / "real_projection.json").write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
+    return results
+
+
+# ----------------------------------------------------------------------------- noise ladder
+@torch.no_grad()
+def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s=(0.9, 0.7, 0.5, 0.3, 0.1), chunk=16):
+    """Where does the flow lose 'realness', and is that the flow or the decoder?
+
+    Real latents of the even-numbered scenes are noised to time t0 and denoised by the flow (t0 0.9 = light noise,
+    0.1 = almost pure noise), then rendered with their own cameras. For each level the same real latents also get
+    plain Gaussian noise of the SAME size (rms error per feature and per position coordinate that the flow's output
+    shows) and are rendered. Distance to real views (KID) is measured against the odd-numbered scenes'
+    reconstructions; the floor is even-numbered against odd-numbered reconstructions. If the flow's renders are
+    much farther from real than the plain-noise renders at the same error size, the flow's error has a structure
+    the decoder is sensitive to; if equal, the size of the error is what matters.
+    """
+    even = [c for i, c in enumerate(ctx) if i % 2 == 0]
+    odd = [c for i, c in enumerate(ctx) if i % 2 == 1]
+    ref = torch.cat([c["recon"] for c in odd])
+    ref_even = torch.cat([c["recon"] for c in even])
+    fname, fn = _feature_fn(device, feature_net, torch.cat([ref, ref_even]))
+    f_ref = _extract(fn, ref)
+    floor = kid_score(f_ref, _extract(fn, ref_even), seed=seed)
+    zA = torch.cat([c["z"] for c in even]); pA = torch.cat([c["pos"] for c in even])
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    def render_all(zs, ps):
+        return [model.render(zs[i:i + 1], ps[i:i + 1], even[i]["ray_o"], even[i]["ray_d"], IMAGE_HW)[0] for i in range(len(even))]
+
+    print(f"\nNoise ladder: {len(even)} real scenes denoised by the flow; reference {len(odd)} other real scenes. Feature space: {fname}")
+    print(f"  KID x1000 floor (real against real): {1000 * floor[0]:.3f} (sd {1000 * floor[1]:.3f})")
+    print(f"  {'start t (sigma)':16s} {'rms err feat/pos':>17s} {'PSNR flow':>10s} {'PSNR noise':>11s} {'KID flow':>12s} {'KID same-size noise':>20s}")
+    results, rows = [], [("real: autoencoder reconstruction", [c["recon"] for c in even[:2]])]
+    for t0 in t0s:
+        zs, ps = [], []
+        for s in range(0, len(zA), chunk):
+            zd, pd = denoise_from(model, zA[s:s + chunk], pA[s:s + chunk], t0, steps, seed=seed + s)
+            zs.append(zd); ps.append(pd)
+        zd, pd = torch.cat(zs), torch.cat(ps)
+        err_f = float((zd - zA).square().mean().sqrt()); err_p = float((pd - pA).square().mean().sqrt())
+        imgs_flow = render_all(zd, pd)
+        zn = zA + torch.randn(zA.shape, device=device, generator=gen) * err_f
+        pn = pA + torch.randn(pA.shape, device=device, generator=gen) * err_p
+        imgs_noise = render_all(zn, pn)
+        p_flow = float(np.mean([psnr(imgs_flow[i], even[i]["recon"]) for i in range(len(even))]))
+        p_noise = float(np.mean([psnr(imgs_noise[i], even[i]["recon"]) for i in range(len(even))]))
+        kid_flow = kid_score(f_ref, _extract(fn, torch.cat(imgs_flow)), seed=seed)
+        kid_noise = kid_score(f_ref, _extract(fn, torch.cat(imgs_noise)), seed=seed)
+        results.append({"start_t": t0, "start_sigma": (1 - t0) / t0, "rms_error_feat": err_f, "rms_error_pos": err_p,
+                        "psnr_flow": p_flow, "psnr_same_size_noise": p_noise,
+                        "kid_x1000_flow": 1000 * kid_flow[0], "kid_x1000_flow_sd": 1000 * kid_flow[1],
+                        "kid_x1000_same_size_noise": 1000 * kid_noise[0], "kid_x1000_same_size_noise_sd": 1000 * kid_noise[1]})
+        print(f"  {t0:.1f} ({(1 - t0) / t0:5.2f})".ljust(18) + f" {err_f:7.3f} / {err_p:6.3f} {p_flow:10.2f} {p_noise:11.2f} "
+              f"{1000 * kid_flow[0]:12.3f} {1000 * kid_noise[0]:20.3f}")
+        rows.append((f"flow, start t={t0}", imgs_flow[:2])); rows.append((f"real + noise of the same size, t={t0}", imgs_noise[:2]))
+    save_grid(out_dir / "8_noise_ladder.png", rows, label_width=330)
+    (out_dir / "noise_ladder.json").write_text(json.dumps({"feature_space": fname, "kid_x1000_floor": [1000 * floor[0], 1000 * floor[1]],
+                                                           "levels": results}, indent=2, allow_nan=False) + "\n")
+    return results
+
+
+# ----------------------------------------------------------------------------- floor against object split of the structure test
+def floor_bands(pos_real, axis=2, bins=60):
+    """Height bands from the real positions: the flat floor is the sharp peak of the height histogram.
+
+    floor: height up to the peak plus its half width (on the upper side); objects: above the peak plus two half widths.
+    The same absolute cuts are applied to generated positions.
+    """
+    zv = pos_real[..., axis].reshape(-1).float().cpu().numpy()
+    hist, edges = np.histogram(zv, bins=bins)
+    k = int(hist.argmax()); width = float(edges[1] - edges[0])
+    mode = float(0.5 * (edges[k] + edges[k + 1])); peak = float(hist[k])
+    j = k
+    while j < len(hist) - 1 and hist[j] > 0.5 * peak:
+        j += 1
+    hw = max(float(0.5 * (edges[j] + edges[j + 1])) - mode, width)
+    return {"axis": axis, "mode": mode, "half_width": hw, "floor_max": mode + hw, "object_min": mode + 2 * hw,
+            "share_in_peak_bin": peak / len(zv)}
+
+
+def band_structure(z, pos, slot_mean, mask, near_k=4, view_size=48, min_tokens=24):
+    """Structure numbers computed only among the tokens selected by mask [S, N] (per scene, then averaged)."""
+    S, N, _ = z.shape
+    grp = torch.clamp(torch.arange(N, device=z.device) // view_size, max=N // view_size)
+    r = z.float() - slot_mean.float()
+    r = r / r.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    rows = []
+    for s in range(S):
+        idx = mask[s].nonzero().squeeze(-1)
+        if len(idx) < min_tokens:
+            continue
+        P = pos[s, idx].float(); D = torch.cdist(P, P)
+        D = D.masked_fill(torch.eye(len(idx), dtype=torch.bool, device=D.device), float("inf"))
+        k = min(near_k, len(idx) - 1)
+        srt, nn = D.topk(k, dim=1, largest=False)
+        rs = r[s, idx]; C = rs @ rs.T
+        g = grp[idx]
+        nn1 = nn[:, 0]; c1 = C[torch.arange(len(idx), device=C.device), nn1]; diff = g[nn1] != g
+        rows.append({"tokens": float(len(idx)), "cos_nearest": float(torch.gather(C, 1, nn).mean()),
+                     "same_view_share": float((g[nn] == g[:, None]).float().mean()), "nn1_dist": float(srt[:, 0].mean()),
+                     "nn1_other_view_share": float(diff.float().mean()),
+                     "cos_nn1_same_view": float(c1[~diff].mean()) if bool((~diff).any()) else float("nan"),
+                     "cos_nn1_other_view": float(c1[diff].mean()) if bool(diff.any()) else float("nan")})
+    if not rows:
+        return None
+    out = {k: float(np.nanmean([r_[k] for r_ in rows])) for k in rows[0]}
+    out["scenes_used"] = len(rows)
+    return out
+
+
+def run_height_split(z1, pos1, slot_mean, gen_sets, out_dir):
+    """Does the missing cross-view structure sit in the floor tokens, the object tokens, or both?"""
+    b = floor_bands(pos1)
+    print(f"\nFloor against object split (height axis {b['axis']}, flow's normalised space): peak at {b['mode']:.3f}, half width "
+          f"{b['half_width']:.3f}; floor = height <= {b['floor_max']:.3f}, objects = height > {b['object_min']:.3f}, tokens in between are left out.")
+    print(f"  (share of real tokens in the peak bin of the height histogram: {100 * b['share_in_peak_bin']:.1f}%; "
+          "a low value means there is no clear flat floor and this split is not meaningful)")
+    sets = [("real validation latents", z1, pos1)] + list(gen_sets)
+    out = {"bands": b, "sets": {}}
+    keys = [("tokens", "tokens per scene", "{:8.1f}"), ("cos_nearest", "feature agreement, 4 nearest", "{:8.3f}"),
+            ("same_view_share", "nearest from same view (real < chance)", "{:8.3f}"), ("nn1_dist", "nearest-token distance", "{:8.3f}"),
+            ("nn1_other_view_share", "nearest neighbour from another view", "{:8.3f}"),
+            ("cos_nn1_same_view", "agreement with it, same view", "{:8.3f}"), ("cos_nn1_other_view", "agreement with it, other view", "{:8.3f}")]
+    print("\n  Height occupancy (share of tokens): floor / between / objects, and mean height")
+    for name, z, pos in sets:
+        h = pos[..., b["axis"]]
+        fl = float((h <= b["floor_max"]).float().mean()); ob = float((h > b["object_min"]).float().mean())
+        print(f"    {name[:60]:60s} {100 * fl:6.1f}% / {100 * (1 - fl - ob):5.1f}% / {100 * ob:5.1f}%   mean height {float(h.mean()):6.3f}")
+        out["sets"][name] = {"floor_share": fl, "object_share": ob, "mean_height": float(h.mean())}
+    for band, label in (("floor", "FLOOR tokens"), ("objects", "OBJECT tokens")):
+        print(f"\n  {label}")
+        print("  " + f"{'':42s}" + "".join(f"{n[:24]:>26s}" for n, _, _ in sets))
+        stats = []
+        for name, z, pos in sets:
+            h = pos[..., b["axis"]]
+            mask = (h <= b["floor_max"]) if band == "floor" else (h > b["object_min"])
+            s_ = band_structure(z, pos, slot_mean, mask)
+            stats.append(s_); out["sets"][name][band] = s_
+        for key, label_, fmt in keys:
+            cells = [("      n/a" if s_ is None else fmt.format(s_[key])) for s_ in stats]
+            print("  " + f"{label_:42s}" + "".join(f"{c:>26s}" for c in cells))
+    (out_dir / "height_split.json").write_text(json.dumps(out, indent=2, allow_nan=False) + "\n")
+    return out
+
+
 # ----------------------------------------------------------------------------- main
 def choose_checkpoint(directory):
     candidates = sorted(Path(directory).glob("*.pt"))   # same ordering as PlatonicAutoencoder.load_ckpt
@@ -973,10 +1193,10 @@ def main():
         raise RuntimeError(f"Checkpoint was trained with diffusion.time_coupling='{saved_coupling}' but --config says "
                            f"'{config_coupling}'. Use the config the run was trained with.")
     print(f"Time coupling: {config_coupling}")
-    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics):
+    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics or args.real_projection):
         raise RuntimeError("This checkpoint uses separate times for positions and features. The default mode and --trace "
                            "assume one time for both and are not valid for it; use --structure, --swap-test, "
-                           "--pca-test, --decoder-tolerance or --gen-metrics.")
+                           "--pca-test, --decoder-tolerance, --gen-metrics or --real-projection.")
     info = load_flow_weights(model, ckpt, args.weights, fm.LatentNormaliser)
     del ckpt
     model.to(device).eval()
@@ -1026,8 +1246,26 @@ def main():
         if args.structure:
             out_dir = args.out_dir.expanduser().resolve() / ("structure_test_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
-            run_structure(model, z1, pos1, args.steps, args.seed, args.scenes, device, out_dir)
+            run_structure(model, z1, pos1, args.steps, args.seed, args.scenes, device, out_dir, height_split=args.height_split)
             print(f"\nSaved structure_test.json in {out_dir}")
+            return
+
+        if args.real_projection:
+            out_dir = args.out_dir.expanduser().resolve() / ("real_projection_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            ctx = build_scene_context(model, ae, val_set, device, edict, n=min(args.val_scenes, len(val_set)))
+            run_real_projection(model, ctx, out_dir)
+            print(f"\nSaved 7_real_projection.png and real_projection.json in {out_dir}")
+            return
+
+        if args.ladder:
+            if config_coupling == "decoupled":
+                raise RuntimeError("--ladder uses the joint-time sampler and cannot be run on a decoupled-time checkpoint.")
+            out_dir = args.out_dir.expanduser().resolve() / ("noise_ladder_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            ctx = build_scene_context(model, ae, val_set, device, edict, n=min(args.val_scenes, len(val_set)))
+            run_ladder(model, ctx, args.steps, args.seed, device, out_dir, feature_net=args.feature_net)
+            print(f"\nSaved 8_noise_ladder.png and noise_ladder.json in {out_dir}")
             return
 
         if args.gen_metrics:
