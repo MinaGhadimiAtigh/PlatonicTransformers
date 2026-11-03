@@ -1017,7 +1017,8 @@ def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s
 
     print(f"\nNoise ladder: {len(even)} real scenes denoised by the flow; reference {len(odd)} other real scenes. Feature space: {fname}")
     print(f"  KID x1000 floor (real against real): {1000 * floor[0]:.3f} (sd {1000 * floor[1]:.3f})")
-    print(f"  {'start t (sigma)':16s} {'rms err feat/pos':>17s} {'PSNR flow':>10s} {'PSNR noise':>11s} {'KID flow':>12s} {'KID same-size noise':>20s}")
+    print(f"  {'start t (sigma)':16s} {'rms err feat/pos':>17s} {'PSNR flow':>10s} {'PSNR noise':>11s} {'KID flow':>12s} {'KID same-size noise':>20s}"
+          f" {'KID flow pos + real feat':>25s} {'KID real pos + flow feat':>25s}")
     results, rows = [], [("real: autoencoder reconstruction", [c["recon"] for c in even[:2]])]
     for t0 in t0s:
         zs, ps = [], []
@@ -1034,13 +1035,23 @@ def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s
         p_noise = float(np.mean([psnr(imgs_noise[i], even[i]["recon"]) for i in range(len(even))]))
         kid_flow = kid_score(f_ref, _extract(fn, torch.cat(imgs_flow)), seed=seed)
         kid_noise = kid_score(f_ref, _extract(fn, torch.cat(imgs_noise)), seed=seed)
+        imgs_pos = render_all(zA, pd)       # flow positions, real features
+        imgs_feat = render_all(zd, pA)      # real positions, flow features
+        kid_pos = kid_score(f_ref, _extract(fn, torch.cat(imgs_pos)), seed=seed)
+        kid_feat = kid_score(f_ref, _extract(fn, torch.cat(imgs_feat)), seed=seed)
+        p_pos = float(np.mean([psnr(imgs_pos[i], even[i]["recon"]) for i in range(len(even))]))
+        p_feat = float(np.mean([psnr(imgs_feat[i], even[i]["recon"]) for i in range(len(even))]))
         results.append({"start_t": t0, "start_sigma": (1 - t0) / t0, "rms_error_feat": err_f, "rms_error_pos": err_p,
                         "psnr_flow": p_flow, "psnr_same_size_noise": p_noise,
                         "kid_x1000_flow": 1000 * kid_flow[0], "kid_x1000_flow_sd": 1000 * kid_flow[1],
-                        "kid_x1000_same_size_noise": 1000 * kid_noise[0], "kid_x1000_same_size_noise_sd": 1000 * kid_noise[1]})
+                        "kid_x1000_same_size_noise": 1000 * kid_noise[0], "kid_x1000_same_size_noise_sd": 1000 * kid_noise[1],
+                        "kid_x1000_flow_positions_real_features": 1000 * kid_pos[0], "psnr_flow_positions_real_features": p_pos,
+                        "kid_x1000_real_positions_flow_features": 1000 * kid_feat[0], "psnr_real_positions_flow_features": p_feat})
         print(f"  {t0:.1f} ({(1 - t0) / t0:5.2f})".ljust(18) + f" {err_f:7.3f} / {err_p:6.3f} {p_flow:10.2f} {p_noise:11.2f} "
-              f"{1000 * kid_flow[0]:12.3f} {1000 * kid_noise[0]:20.3f}")
+              f"{1000 * kid_flow[0]:12.3f} {1000 * kid_noise[0]:20.3f} {1000 * kid_pos[0]:25.3f} {1000 * kid_feat[0]:25.3f}")
         rows.append((f"flow, start t={t0}", imgs_flow[:2])); rows.append((f"real + noise of the same size, t={t0}", imgs_noise[:2]))
+        if t0 in (0.7, 0.5, 0.3):
+            rows.append((f"flow positions + real features, t={t0}", imgs_pos[:2])); rows.append((f"real positions + flow features, t={t0}", imgs_feat[:2]))
     save_grid(out_dir / "8_noise_ladder.png", rows, label_width=330)
     (out_dir / "noise_ladder.json").write_text(json.dumps({"feature_space": fname, "kid_x1000_floor": [1000 * floor[0], 1000 * floor[1]],
                                                            "levels": results}, indent=2, allow_nan=False) + "\n")
