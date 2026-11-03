@@ -13,7 +13,8 @@ It loads a Lightning checkpoint (EMA weights by default, exactly what validation
 Add --trace (fast trajectory trace), --decoder-tolerance (how much latent noise the decoder tolerates) or --swap-test
 (do generated positions or generated features ruin the images) or --pca-test (is generated feature damage off the
 real feature subspace) or --structure (numbers for crowding and for how consistent the features of nearby tokens
-are, real against generated; use --scenes 64) to run only that part.
+are, real against generated; use --scenes 64) or --gen-metrics (distribution metrics on rendered views, generated
+against real; use --scenes 128) to run only that part.
 Add --split train to use training scenes.
 Run from the PlatonicTransformers folder (where mains/ and configs/ are), e.g.
   PYTHONPATH="/media/mina/hdd/amlab/nvsm/PlatonicTransformers:/media/mina/hdd/amlab/nvsm/PlatonicSplats${PYTHONPATH:+:$PYTHONPATH}" \
@@ -62,6 +63,11 @@ def parse_args():
     p.add_argument("--structure", action="store_true",
                    help="Only compare how tokens are arranged and how consistent the features of nearby tokens are, "
                         "real against generated (numbers, no rendering). Use --scenes 64.")
+    p.add_argument("--gen-metrics", action="store_true",
+                   help="Only compute distribution metrics on rendered views, generated against real (use --scenes 128 and "
+                        "--val-scenes 64; run every checkpoint with the same values for a fair comparison).")
+    p.add_argument("--feature-net", choices=("auto", "dinov2", "lowlevel"), default="auto",
+                   help="Feature network for --gen-metrics; 'lowlevel' skips the download and reports the crude descriptor only.")
     p.add_argument("--trace", action="store_true",
                    help="Only trace where the flow leaves the data distribution along sampling paths (fast).")
     return p.parse_args()
@@ -703,6 +709,208 @@ def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir):
                                                             indent=2, allow_nan=False) + "\n")
 
 
+
+# ----------------------------------------------------------------------------- generation metrics
+def _clean_images(x):
+    return torch.nan_to_num(x.float(), nan=0.0).clamp(0, 1)
+
+
+def lowlevel_descriptor(img):
+    """[N,3,H,W] in [0,1] -> [N,296] colour, saturation, brightness, gradient and coarse layout descriptor.
+
+    Needs no download. Crude: it sees colours, edge sharpness and where things are, not object identity.
+    """
+    import torch.nn.functional as F
+    img = _clean_images(img).cpu()
+    n = img.shape[0]
+    mx, mn = img.max(1).values, img.min(1).values
+    sat = (mx - mn) / (mx + 1e-6)
+    q = (img * 3.999).long().clamp(0, 3)
+    rgb_idx = q[:, 0] * 16 + q[:, 1] * 4 + q[:, 2]
+    gray = 0.299 * img[:, 0] + 0.587 * img[:, 1] + 0.114 * img[:, 2]
+    rows = []
+    for i in range(n):
+        h_rgb = torch.bincount(rgb_idx[i].flatten(), minlength=64).float()
+        h_sat = torch.histc(sat[i], bins=8, min=0, max=1)
+        h_val = torch.histc(mx[i], bins=8, min=0, max=1)
+        parts = [h_rgb / h_rgb.sum(), h_sat / h_sat.sum(), h_val / h_val.sum()]
+        for s in (1, 2):
+            g = gray[i:i + 1, None]
+            if s > 1:
+                g = F.avg_pool2d(g, s)
+            gx = g[..., :, 1:] - g[..., :, :-1]; gy = g[..., 1:, :] - g[..., :-1, :]
+            mag = torch.sqrt(gx[..., :-1, :].square() + gy[..., :, :-1].square() + 1e-12)
+            hh = torch.histc(torch.log10(mag + 1e-3), bins=12, min=-3, max=0.3)
+            parts.append(hh / hh.sum())
+        parts.append(F.adaptive_avg_pool2d(img[i:i + 1], 8).flatten())
+        rows.append(torch.cat(parts))
+    return torch.stack(rows)
+
+
+def image_scalars(img):
+    """Per-image numbers: share of strongly coloured pixels, mean edge strength, share of high-frequency energy."""
+    img = _clean_images(img).cpu()
+    mx, mn = img.max(1).values, img.min(1).values
+    sat = (mx - mn) / (mx + 1e-6)
+    colour = ((sat > 0.35) & (mx > 0.25)).float().mean(dim=(1, 2))
+    gray = 0.299 * img[:, 0] + 0.587 * img[:, 1] + 0.114 * img[:, 2]
+    gx = gray[:, :, 1:] - gray[:, :, :-1]; gy = gray[:, 1:, :] - gray[:, :-1, :]
+    edge = torch.sqrt(gx[:, :-1, :].square() + gy[:, :, :-1].square() + 1e-12).mean(dim=(1, 2))
+    spec = torch.fft.rfft2(gray - gray.mean(dim=(1, 2), keepdim=True)).abs().square()
+    fy = torch.fft.fftfreq(gray.shape[1])[:, None].abs(); fx = torch.fft.rfftfreq(gray.shape[2])[None, :]
+    rad = torch.sqrt(fy.square() + fx.square())
+    hf = (spec * (rad > 0.25)).sum(dim=(1, 2)) / spec.sum(dim=(1, 2)).clamp(min=1e-12)
+    return {"colour_share": colour, "edge_strength": edge, "high_freq_share": hf}
+
+
+def load_deep_features(device, which="auto"):
+    """Returns (name, fn) with fn: [N,3,H,W] in [0,1] -> [N,D] features, or (None, reasons) if nothing could be loaded."""
+    import torch.nn.functional as F
+    reasons = []
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    def prep(x):
+        x = F.interpolate(_clean_images(x).to(device), size=(224, 224), mode="bilinear", align_corners=False)
+        return (x - mean) / std
+
+    if which in ("auto", "dinov2"):
+        try:
+            from transformers import AutoModel
+            net = AutoModel.from_pretrained("facebook/dinov2-small").to(device).eval()
+
+            @torch.no_grad()
+            def f(x):
+                h = net(pixel_values=prep(x)).last_hidden_state
+                return torch.cat([h[:, 0], h[:, 1:].mean(1)], dim=1).float().cpu()
+            return "DINOv2-small (transformers, class token + mean patch token)", f
+        except Exception as e:
+            reasons.append(f"transformers DINOv2: {type(e).__name__}: {str(e)[:120]}")
+        try:
+            net = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14").to(device).eval()
+
+            @torch.no_grad()
+            def f(x):
+                o = net.forward_features(prep(x))
+                return torch.cat([o["x_norm_clstoken"], o["x_norm_patchtokens"].mean(1)], dim=1).float().cpu()
+            return "DINOv2-small (torch.hub, class token + mean patch token)", f
+        except Exception as e:
+            reasons.append(f"torch.hub DINOv2: {type(e).__name__}: {str(e)[:120]}")
+    return None, reasons
+
+
+def _extract(fn, images, chunk=64):
+    return torch.cat([fn(images[i:i + chunk]) for i in range(0, len(images), chunk)])
+
+
+def kid_score(a, b, subset=100, n_subsets=50, seed=0):
+    """Unbiased kernel distance (polynomial kernel, Binkowski et al.) averaged over random subsets: (mean, sd)."""
+    a, b = a.double(), b.double()
+    d, m = a.shape[1], min(subset, len(a), len(b))
+    g = torch.Generator().manual_seed(seed)
+    vals = []
+    for _ in range(n_subsets):
+        x = a[torch.randperm(len(a), generator=g)[:m]]; y = b[torch.randperm(len(b), generator=g)[:m]]
+        kxx = (x @ x.T / d + 1) ** 3; kyy = (y @ y.T / d + 1) ** 3; kxy = (x @ y.T / d + 1) ** 3
+        vals.append(float((kxx.sum() - kxx.diag().sum()) / (m * (m - 1)) + (kyy.sum() - kyy.diag().sum()) / (m * (m - 1))
+                          - 2 * kxy.mean()))
+    return float(np.mean(vals)), float(np.std(vals))
+
+
+def nearest_similarity(a, b):
+    """Cosine similarity of each row of a to its nearest row of b."""
+    a = torch.nn.functional.normalize(a.double(), dim=1); b = torch.nn.functional.normalize(b.double(), dim=1)
+    return (a @ b.T).max(dim=1).values
+
+
+def view_similarity_gap(feats, n_views):
+    """Mean cosine between different views of the SAME scene minus between views of DIFFERENT scenes."""
+    f = torch.nn.functional.normalize(feats.double(), dim=1)
+    n_scenes = len(f) // n_views
+    sim = f @ f.T
+    scene = torch.arange(len(f)) // n_views
+    view = torch.arange(len(f)) % n_views
+    same_scene, diff_view = scene[:, None] == scene[None, :], view[:, None] != view[None, :]
+    within = sim[same_scene & diff_view].mean()
+    between = sim[~same_scene & diff_view].mean()
+    return float(within), float(between), float(within - between)
+
+
+@torch.no_grad()
+def run_gen_metrics(model, ctx, n_gen, steps, seed, device, out_dir, feature_net="auto"):
+    """Distribution metrics on RENDERED views: generated scenes against the autoencoder's reconstructions of real scenes.
+
+    Reference images are the autoencoder reconstructions of the real scenes in `ctx` (same decoder as the generated
+    ones, so decoder blur cancels; the numbers measure the gap in the latent distribution, not the decoder).
+    Generated scene i is rendered with the cameras of real scene i (modulo the number of real scenes).
+    """
+    n_real = len(ctx)
+    ref = torch.cat([c["recon"] for c in ctx])                  # [n_real * V, 3, H, W]
+    n_views = ctx[0]["recon"].shape[0]
+    zs, ps, name = [], [], None
+    for c in range(0, n_gen, 16):
+        out = generate_samples(model, min(16, n_gen - c), steps, seed + c, device)
+        name, zg, pg = out[0]                                    # the run's own sampler
+        zs.append(zg); ps.append(pg)
+    zg, pg = torch.cat(zs), torch.cat(ps)
+    gen_stacks = [model.render(zg[i:i + 1], pg[i:i + 1], ctx[i % n_real]["ray_o"], ctx[i % n_real]["ray_d"], IMAGE_HW)[0]
+                  for i in range(n_gen)]
+    gen = torch.cat(gen_stacks)
+    print(f"\nGeneration metrics: {n_gen} generated scenes ({len(gen)} views) against {n_real} real scenes ({len(ref)} views).")
+    print(f"  sampler: {name}")
+
+    half = np.arange(n_real) % 2                                  # real-against-real floor: even against odd scenes
+    def ref_idx(mask):
+        return torch.tensor([i * n_views + v for i in range(n_real) if mask[i] for v in range(n_views)]).long()
+    ref_a, ref_b = ref[ref_idx(half == 0)], ref[ref_idx(half == 1)]
+
+    results = {"sampler": name, "n_generated_scenes": n_gen, "n_real_scenes": n_real, "views_per_scene": n_views}
+    spaces = []
+    ll = lowlevel_descriptor(torch.cat([ref, gen]))
+    mu, sd_ = ll[:len(ref)].mean(0), ll[:len(ref)].std(0)
+    sd_ = torch.maximum(sd_, sd_.median().clamp(min=1e-6))   # never amplify dimensions that barely vary in the real data
+    ll = ((ll - mu) / sd_).clamp(-10, 10)
+    spaces.append(("low-level colour/edge/layout descriptor", ll[:len(ref)], ll[len(ref):], ll[:len(ref)][ref_idx(half == 0)],
+                   ll[:len(ref)][ref_idx(half == 1)]))
+    deep_name, deep = load_deep_features(device, feature_net)
+    if deep_name is None:
+        print("  deep features not used" + (" (" + "; ".join(deep) + ")" if deep else " (--feature-net lowlevel)") + "; only the low-level metrics are reported.")
+        results["deep_feature_error"] = deep
+    else:
+        fr = _extract(deep, ref); fg = _extract(deep, gen)
+        spaces.append((deep_name, fr, fg, fr[ref_idx(half == 0)], fr[ref_idx(half == 1)]))
+
+    results["spaces"] = {}
+    for sname, fr, fg, fa, fb in spaces:
+        kid_gen = kid_score(fr, fg, seed=seed); kid_floor = kid_score(fa, fb, seed=seed)
+        nn_gen = nearest_similarity(fg, fa); nn_floor = nearest_similarity(fb, fa)
+        thr = float(torch.quantile(nn_floor, 0.95))
+        w_r, b_r, g_r = view_similarity_gap(fr, n_views); w_g, b_g, g_g = view_similarity_gap(fg, n_views)
+        results["spaces"][sname] = {
+            "kid_x1000_generated_vs_real": [1000 * kid_gen[0], 1000 * kid_gen[1]],
+            "kid_x1000_real_even_vs_odd_floor": [1000 * kid_floor[0], 1000 * kid_floor[1]],
+            "nearest_real_similarity_generated": float(nn_gen.mean()), "nearest_real_similarity_real_floor": float(nn_floor.mean()),
+            "share_generated_above_floor_95th_percentile": float((nn_gen > thr).float().mean()),
+            "view_similarity_within_between_gap_real": [w_r, b_r, g_r], "view_similarity_within_between_gap_generated": [w_g, b_g, g_g]}
+        print(f"\n  Feature space: {sname}")
+        print(f"    KID x1000, generated against real   {1000 * kid_gen[0]:9.3f} (sd over subsets {1000 * kid_gen[1]:.3f})")
+        print(f"    KID x1000, real against real (floor){1000 * kid_floor[0]:9.3f} (sd {1000 * kid_floor[1]:.3f}; half of the real scenes against the other half)")
+        print(f"    nearest real image, cosine similarity: generated {float(nn_gen.mean()):.3f}, real-to-real floor {float(nn_floor.mean()):.3f}; "
+              f"{100 * float((nn_gen > thr).float().mean()):.1f}% of generated views are closer than the floor's 95th percentile (copies would be near 100%)")
+        print(f"    views of one scene: similarity within {w_r:.3f} / between {b_r:.3f} / gap {g_r:.3f} for real; {w_g:.3f} / {b_g:.3f} / {g_g:.3f} for generated")
+
+    sr, sg = image_scalars(ref), image_scalars(gen)
+    print("\n  Image statistics (mean, sd over views):    real          generated")
+    results["image_statistics"] = {}
+    for k in sr:
+        print(f"    {k:22s} {float(sr[k].mean()):10.4f} ({float(sr[k].std()):.4f})   {float(sg[k].mean()):10.4f} ({float(sg[k].std()):.4f})")
+        results["image_statistics"][k] = {"real": [float(sr[k].mean()), float(sr[k].std())], "generated": [float(sg[k].mean()), float(sg[k].std())]}
+    save_grid(out_dir / "6_gen_metrics_scenes.png", [("real: autoencoder reconstruction", [c["recon"] for c in ctx[:4]]),
+                                                     (f"generated: {name}", gen_stacks[:4]), ("generated (next 4)", gen_stacks[4:8])], label_width=330)
+    (out_dir / "gen_metrics.json").write_text(json.dumps(results, indent=2, allow_nan=False) + "\n")
+    return results
+
+
 # ----------------------------------------------------------------------------- main
 def choose_checkpoint(directory):
     candidates = sorted(Path(directory).glob("*.pt"))   # same ordering as PlatonicAutoencoder.load_ckpt
@@ -765,10 +973,10 @@ def main():
         raise RuntimeError(f"Checkpoint was trained with diffusion.time_coupling='{saved_coupling}' but --config says "
                            f"'{config_coupling}'. Use the config the run was trained with.")
     print(f"Time coupling: {config_coupling}")
-    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance):
+    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics):
         raise RuntimeError("This checkpoint uses separate times for positions and features. The default mode and --trace "
                            "assume one time for both and are not valid for it; use --structure, --swap-test, "
-                           "--pca-test or --decoder-tolerance.")
+                           "--pca-test, --decoder-tolerance or --gen-metrics.")
     info = load_flow_weights(model, ckpt, args.weights, fm.LatentNormaliser)
     del ckpt
     model.to(device).eval()
@@ -820,6 +1028,15 @@ def main():
             out_dir.mkdir(parents=True, exist_ok=False)
             run_structure(model, z1, pos1, args.steps, args.seed, args.scenes, device, out_dir)
             print(f"\nSaved structure_test.json in {out_dir}")
+            return
+
+        if args.gen_metrics:
+            out_dir = args.out_dir.expanduser().resolve() / ("gen_metrics_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            ctx = build_scene_context(model, ae, val_set, device, edict, n=min(args.val_scenes, len(val_set)))
+            run_gen_metrics(model, ctx, args.scenes, args.steps, args.seed, device, out_dir,
+                            feature_net="lowlevel" if args.feature_net == "lowlevel" else args.feature_net)
+            print(f"\nSaved 6_gen_metrics_scenes.png and gen_metrics.json in {out_dir}")
             return
 
         if args.pca_test:
