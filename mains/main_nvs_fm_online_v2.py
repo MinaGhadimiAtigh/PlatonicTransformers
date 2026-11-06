@@ -23,6 +23,18 @@ Key differences from QM9FMModel:
     val/gen_var_ratio_* and val/real_var_ratio_* (variance of generated / real validation latents in groups of
     PCA directions of the real training latents; 1.0 is ideal), and a checkpoint every
     checkpoint.snapshot_every_n_epochs epochs (default 50, 0 = off).
+  - optional conditioning on the STARTING POSITIONS of the registers (diffusion.condition_start, default false = the
+    previous behaviour, unchanged). The autoencoder's encoder moves every register from a starting position, which the
+    input cameras fix, to its final position. With condition_start the flow gets the starting positions (3 numbers per
+    token) as extra input and only generates the final positions and the features. Options (all under diffusion:):
+      start_mode: input   the starting positions are extra input channels; the flow still generates the positions
+      start_mode: offset  the flow generates the offset (position - start) / start_offset_scale instead, and its attention
+                          geometry is the starting position plus the noisy offset
+      start_dropout: p    each scene's starting positions are hidden with probability p during training (with an extra
+                          'given' channel), so the same network can also generate without them (sample(start=None))
+      start_offset_scale  scale of the offset in offset mode (the move has rms about 0.58 per coordinate)
+    At generation the starting positions come from camera sets: use those of validation scenes (the flow never trained
+    on them), because the starting positions of a training scene's cameras could identify that scene. See StartCond.
 """
 
 import os
@@ -76,6 +88,10 @@ class LatentNormaliser:
         pos_n  = (pos  - self.pos_mean.to(dev))  / self.pos_scale.to(dev)
         feat_n = (feat - self.feat_mean.to(dev)) / self.feat_std.to(dev)
         return pos_n, feat_n
+
+    def normalise_pos(self, pos):
+        """Positions only (e.g. the autoencoder's starting positions): the same map as normalise()."""
+        return (pos - self.pos_mean.to(pos.device)) / self.pos_scale.to(pos.device)
 
     def denormalise(self, pos_n, feat_n):
         dev = feat_n.device
@@ -170,6 +186,35 @@ def load_normaliser(path, ae_ckpt_dir):
             f"'{ae_ckpt_dir}'. Delete the file to refit, or point normaliser_path elsewhere."
         )
     return LatentNormaliser.from_state_dict(state)
+
+
+# ---------------------------------------------------------------------------
+# Starting positions (conditioning)
+# ---------------------------------------------------------------------------
+
+class StartCond:
+    """Starting positions of the register tokens in the flow's (normalised) position space, plus a per-scene flag.
+
+    s       [B, N, 3]  where each register starts before the autoencoder's encoder moves it. With the autoencoder's
+                       ray_unproject initialisation and jitter_std 0 these depend only on the input cameras, not on
+                       the images (the flow script checks this once against ae.register_init).
+    present [B]        1.0 or 0.0: whether the scene's starting positions are given. 0.0 hides them (start dropout in
+                       training, unconditional sampling).
+    Slicing returns a StartCond for those scenes.
+    """
+
+    def __init__(self, s, present=None):
+        self.s = s
+        self.present = (torch.ones(s.shape[0], device=s.device, dtype=s.dtype) if present is None
+                        else present.to(device=s.device, dtype=s.dtype))
+
+    def __len__(self):
+        return self.s.shape[0]
+
+    def __getitem__(self, idx):
+        if isinstance(idx, int):
+            idx = slice(idx, idx + 1)
+        return StartCond(self.s[idx], self.present[idx])
 
 
 # ---------------------------------------------------------------------------
@@ -296,13 +341,47 @@ class NVSFMModel(pl.LightningModule):
             raise ValueError(f"diffusion.time_coupling must be 'joint' or 'decoupled', got '{self.time_coupling}'")
         self._n_noise_inputs = 2 if self.time_coupling == "decoupled" else 1
 
+        # Conditioning on the starting positions of the registers (all keys optional; default = off = the previous
+        # behaviour). The encoder moves each register from a starting position (fixed by the input cameras) to its final
+        # position; the final positions of different views then meet on the same surface points. Without the starting
+        # positions the flow has to invent the camera arrangement and the scene together.
+        #   condition_start: true   the flow gets the starting positions s (3 numbers per token, flow space) as extra
+        #        input channels (scalar channels, so only the trivial group is allowed: coordinates would break the
+        #        equivariance of a non-trivial one).
+        #   start_mode: "input" (default)  the flow still generates the positions p.
+        #               "offset"           the flow generates the offset d = (p - s) / start_offset_scale; the network's
+        #        attention geometry is s + c_in * scale * (noisy d), i.e. anchored at the starting positions.
+        #   start_dropout: probability of hiding s for a training scene (adds a 'given' channel); the same network can then
+        #        also generate without starting positions (sample(start=None)). 0 = always given.
+        #   start_offset_scale: offset mode only; the move has rms about 0.58 per coordinate in flow space.
+        d_ = config.diffusion
+        self.cond_start         = bool(d_.get("condition_start", False))
+        self.start_mode         = str(d_.get("start_mode", "input")).lower()
+        self.start_dropout      = float(d_.get("start_dropout", 0.0))
+        self.start_offset_scale = float(d_.get("start_offset_scale", 0.58))
+        if self.start_mode not in ("input", "offset"):
+            raise ValueError(f"diffusion.start_mode must be 'input' or 'offset', got '{self.start_mode}'")
+        if not (0.0 <= self.start_dropout < 1.0):
+            raise ValueError("diffusion.start_dropout must be in [0, 1)")
+        if self.start_offset_scale <= 0.0:
+            raise ValueError("diffusion.start_offset_scale must be > 0")
+        if self.cond_start and str(config.model.solid_name).lower() != "trivial":
+            raise ValueError("condition_start gives the starting positions as scalar channels, which is only valid for "
+                             "model.solid_name 'trivial'.")
+        if self.cond_start and config.training.get("train_augm", False):
+            raise ValueError("condition_start cannot be combined with training.train_augm (the starting positions would "
+                             "need the same rotation).")
+        self._n_cond_inputs = (3 + (1 if self.start_dropout > 0 else 0)) if self.cond_start else 0
+        self._start_checked = False
+        self._val_start_cache = None
+
         # Flow matching network
         solid_name = config.model.solid_name.lower()
         if solid_name not in PLATONIC_GROUPS:
             raise ValueError(f"Unsupported solid_name '{solid_name}'")
 
         self.net = PlatonicTransformer(
-            input_dim=self.scalar_dim + self._n_noise_inputs,
+            input_dim=self.scalar_dim + self._n_noise_inputs + self._n_cond_inputs,
             input_dim_vec=0,
             hidden_dim=config.model.hidden_dim,
             output_dim=self.scalar_dim,
@@ -396,6 +475,11 @@ class NVSFMModel(pl.LightningModule):
                   f"clean sigma {self.pos_clean_sigma:g}, positions {self.pos_speedup:g}x faster when sampling)")
         else:
             print("[NVSFMModel] time coupling: joint")
+        if self.cond_start:
+            print(f"[NVSFMModel] conditioning on the starting positions: mode {self.start_mode}, start dropout "
+                  f"{self.start_dropout:g}" + (f", offset scale {self.start_offset_scale:g}" if self.start_mode == "offset" else ""))
+        else:
+            print("[NVSFMModel] conditioning on the starting positions: off")
 
         # Cache of training latents for copy_ratio — built lazily
         self._train_feats_cache = None
@@ -430,6 +514,7 @@ class NVSFMModel(pl.LightningModule):
             checkpoint["latent_normaliser"] = self.normaliser.state_dict()
         checkpoint["feat_prediction"] = self.feat_prediction
         checkpoint["time_coupling"] = self.time_coupling
+        checkpoint["conditioning"] = self._conditioning_state()
 
     def on_load_checkpoint(self, checkpoint):
         # Checkpoints from before this option have no key and were trained with "edm". Loading weights with
@@ -446,6 +531,14 @@ class NVSFMModel(pl.LightningModule):
                 f"This checkpoint was trained with diffusion.time_coupling='{saved_coupling}' but the config "
                 f"says '{self.time_coupling}'. Set diffusion.time_coupling: {saved_coupling} to load it."
             )
+        mine = self._conditioning_state()
+        saved_c = checkpoint.get("conditioning", {"start": False, "mode": "input", "dropout_on": False,
+                                                  "offset_scale": mine["offset_scale"]})
+        if saved_c["start"] != mine["start"] or (mine["start"] and (
+                saved_c["mode"] != mine["mode"] or saved_c["dropout_on"] != mine["dropout_on"]
+                or (mine["mode"] == "offset" and abs(saved_c["offset_scale"] - mine["offset_scale"]) > 1e-9))):
+            raise ValueError(f"This checkpoint was trained with conditioning {saved_c} but the config says {mine}. "
+                             f"Use the diffusion.condition_start / start_mode / start_dropout / start_offset_scale of the run.")
         saved = checkpoint.get("latent_normaliser")
         if saved is not None:
             self.normaliser = LatentNormaliser.from_state_dict(saved)
@@ -455,6 +548,69 @@ class NVSFMModel(pl.LightningModule):
                 "This run uses a latent normaliser (dataset.norm_passes > 0) but the checkpoint "
                 "has none, so it was trained on raw latents. Set norm_passes: 0 to match it."
             )
+
+    def _conditioning_state(self):
+        return {"start": self.cond_start, "mode": self.start_mode, "dropout_on": self.start_dropout > 0,
+                "offset_scale": self.start_offset_scale}
+
+    # -----------------------------------------------------------------------
+    # Starting positions (conditioning)
+    # -----------------------------------------------------------------------
+
+    def as_cond(self, start, B=None, device=None):
+        """None, a tensor [B, N, 3] (flow space) or a StartCond -> StartCond, or None for a model without conditioning
+        (whatever is passed). A conditioned model given None runs WITHOUT starting positions, which only works if it
+        was trained with start_dropout > 0 (it then has a 'given' channel)."""
+        if not self.cond_start:
+            return None
+        if isinstance(start, StartCond):
+            return start
+        if start is None:
+            if self.start_dropout <= 0:
+                raise ValueError("This flow was trained without start_dropout, so it cannot generate without the "
+                                 "starting positions. Pass start=...")
+            if B is None or device is None:
+                raise ValueError("as_cond(None) needs B and device")
+            return StartCond(torch.zeros(B, self.n_tokens, 3, device=device), torch.zeros(B, device=device))
+        return StartCond(start)
+
+    def _start_parts(self, cond, ref):
+        """(s_eff [B, N, 3], scale [B, 1, 1], channels [B, N, C]) of a StartCond; hidden scenes get s_eff 0 and scale 1.
+        (None, None, None) for a model without conditioning or without start."""
+        if cond is None or not self.cond_start:
+            return None, None, None
+        pres  = cond.present.to(ref.dtype)[:, None, None]
+        s_eff = cond.s.to(ref.dtype) * pres
+        if self.start_mode == "offset":
+            scale = torch.where(pres > 0, torch.full_like(pres, self.start_offset_scale), torch.ones_like(pres))
+        else:
+            scale = torch.ones_like(pres)
+        chans = [s_eff] + ([pres.expand(-1, s_eff.shape[1], 1)] if self.start_dropout > 0 else [])
+        return s_eff, scale, torch.cat(chans, dim=-1)
+
+    def _pos_to_state(self, pos, cond):
+        """Positions to the flow's position state: unchanged in input mode, the scaled offset from the start in offset mode."""
+        if cond is None or not self.cond_start or self.start_mode != "offset":
+            return pos
+        s_eff, scale, _ = self._start_parts(cond, pos)
+        return (pos - s_eff) / scale
+
+    def _state_to_pos(self, state, cond):
+        if cond is None or not self.cond_start or self.start_mode != "offset":
+            return state
+        s_eff, scale, _ = self._start_parts(cond, state)
+        return s_eff + scale * state
+
+    def norm_start(self, s):
+        """Raw starting positions from the autoencoder to the flow's position space."""
+        return s if self.normaliser is None else self.normaliser.normalise_pos(s)
+
+    @torch.no_grad()
+    def start_from_rays(self, ray_o, ray_d):
+        """Starting positions of the registers from the input cameras' rays alone (no images), in the flow's space.
+        ray_o, ray_d: [B, V_in, 3, H, W] as returned by process_data.compute_rays."""
+        _, pos = self.autoencoder.register_init(ray_o, ray_d)
+        return self.norm_start(pos)
 
     # -----------------------------------------------------------------------
     # Core FM math
@@ -492,10 +648,15 @@ class NVSFMModel(pl.LightningModule):
         c_noise = ((1 - t_) / t_).log() / 4
         return c_in, c_skip, c_out, c_noise
 
-    def _forward_net(self, x_t, pos_t, t, t_pos=None):
+    def _forward_net(self, x_t, pos_t, t, t_pos=None, start=None):
         """Run the network. Returns the raw feature output, the raw position output and the EDM coefficients
         (c_skip, c_out) for features and for positions (shape [B, 1, 1]). In "joint" mode positions use t too.
-        In "decoupled" mode t_pos (default: t) is the position time and the network gets both noise levels."""
+        In "decoupled" mode t_pos (default: t) is the position time and the network gets both noise levels.
+        start: a StartCond, required when the model is conditioned on the starting positions. pos_t is then the position
+        STATE (the position itself in input mode, the scaled offset from the start in offset mode)."""
+        if self.cond_start and start is None:
+            raise ValueError("This flow is conditioned on the starting positions: pass start=StartCond(...) or use "
+                             "model.as_cond(None, B, device) for the unconditional mode of a start-dropout model.")
         decoupled = self.time_coupling == "decoupled"
         t_  = t[:, None, None]
         tp_ = t_ if (t_pos is None or not decoupled) else t_pos[:, None, None]
@@ -511,7 +672,10 @@ class NVSFMModel(pl.LightningModule):
 
         x_in      = c_in * x_t
         pos_in    = c_in_p * pos_t
-        scalar_in = torch.cat([x_in] + noise_inputs, dim=-1)
+        s_eff, s_scale, cond_in = self._start_parts(start, x_t)
+        if s_eff is not None and self.start_mode == "offset":
+            pos_in = s_eff + c_in_p * s_scale * pos_t        # geometry anchored at the starting positions
+        scalar_in = torch.cat([x_in] + noise_inputs + ([cond_in] if cond_in is not None else []), dim=-1)
 
         scalar_out, vector_out = self.net(
             scalar_in, pos_in, batch=None,
@@ -519,8 +683,8 @@ class NVSFMModel(pl.LightningModule):
         )
         return scalar_out, vector_out.squeeze(-2), (c_skip, c_out), (c_skip_p, c_out_p)
 
-    def _velocity(self, x_t, pos_t, t, t_pos=None):
-        scalar_out, vector_out, (c_skip, c_out), (c_skip_p, c_out_p) = self._forward_net(x_t, pos_t, t, t_pos)
+    def _velocity(self, x_t, pos_t, t, t_pos=None, start=None):
+        scalar_out, vector_out, (c_skip, c_out), (c_skip_p, c_out_p) = self._forward_net(x_t, pos_t, t, t_pos, start=start)
         t_ = t[:, None, None]
         if self.feat_prediction == "x":
             # the network output IS the clean-feature estimate x_hat
@@ -530,20 +694,23 @@ class NVSFMModel(pl.LightningModule):
         v_pos = c_skip_p * pos_t + c_out_p * vector_out
         return v_x, v_pos
 
-    def _flow_losses(self, x1, pos1, x0, pos0, t, t_pos=None):
+    def _flow_losses(self, x1, pos1, x0, pos0, t, t_pos=None, start=None):
         """Weighted feature and position losses, and the plain feature MSE of the clean estimate.
 
         edm mode: identical to the previous code (EDM-weighted velocity error).
         x mode:   features use edm_weight / max(1 - t, xpred_loss_floor)^2 * (x_hat - x1)^2, which equals the
                   EDM-weighted velocity error for t < 1 - floor. Positions are unchanged.
         feat_xhat_mse is (x_hat - x1)^2 averaged, with x_hat = x_t + (1 - t) v in edm mode, so it can be
-        compared across the two modes."""
+        compared across the two modes.
+        pos1 are POSITIONS (flow space); with start in offset mode the flow's position state is the scaled offset from
+        the starting positions, and the position loss is in those units (pos0 is noise in state space)."""
+        pos1 = self._pos_to_state(pos1, start)
         t_  = t[:, None, None]
         tp_ = t_ if (t_pos is None or self.time_coupling != "decoupled") else t_pos[:, None, None]
         x_t   = (1 - t_)  * x0   + t_  * x1
         pos_t = (1 - tp_) * pos0 + tp_ * pos1
 
-        scalar_out, vector_out, (c_skip, c_out), (c_skip_p, c_out_p) = self._forward_net(x_t, pos_t, t, t_pos)
+        scalar_out, vector_out, (c_skip, c_out), (c_skip_p, c_out_p) = self._forward_net(x_t, pos_t, t, t_pos, start=start)
         weight   = self._edm_weight(t_)
         weight_p = self._edm_weight(tp_)
 
@@ -575,9 +742,14 @@ class NVSFMModel(pl.LightningModule):
         return 2.0 - (2 * t - 1) ** 2 / (t ** 2 + (1 - t) ** 2)
 
     @torch.no_grad()
-    def _noise_level_ratios(self, x1, pos1, batch_idx):
-        """Velocity error / baseline at fixed noise levels, with fixed noise so epochs are comparable."""
+    def _noise_level_ratios(self, x1, pos1, batch_idx, start=None):
+        """Velocity error / baseline at fixed noise levels, with fixed noise so epochs are comparable.
+        With start in offset mode the noise is in the offset state; the position error is reported in position units."""
         out = {}
+        pos1 = self._pos_to_state(pos1, start)
+        _, p_scale, _ = self._start_parts(start, x1)
+        if p_scale is None:
+            p_scale = 1.0
         gen = torch.Generator(device=x1.device)
         gen.manual_seed(1234 + int(batch_idx))
         B = x1.shape[0]
@@ -589,15 +761,15 @@ class NVSFMModel(pl.LightningModule):
             pos0 = torch.randn(pos1.shape, device=x1.device, dtype=x1.dtype, generator=gen)
             x_t   = (1 - t_) * x0   + t_ * x1
             pos_t = (1 - t_) * pos0 + t_ * pos1
-            vx, vp = self._velocity(x_t, pos_t, t)
+            vx, vp = self._velocity(x_t, pos_t, t, start=start)
             base = self._no_structure_baseline(torch.tensor(t_val)).item()
             out[f"val/ratio_feat_sig{sigma:g}"] = (vx - (x1 - x0)).square().mean() / base
-            out[f"val/ratio_pos_sig{sigma:g}"]  = (vp - (pos1 - pos0)).square().mean() / base
+            out[f"val/ratio_pos_sig{sigma:g}"]  = (p_scale * (vp - (pos1 - pos0))).square().mean() / base
             if self.time_coupling == "decoupled":
                 # the situation of the second half of sampling: features at this noise level, positions nearly clean
                 tp_c  = torch.full_like(t, self._t_clean)
                 pos_c = (1 - self._t_clean) * pos0 + self._t_clean * pos1
-                vx_c, _ = self._velocity(x_t, pos_c, t, tp_c)
+                vx_c, _ = self._velocity(x_t, pos_c, t, tp_c, start=start)
                 out[f"val/ratio_feat_sig{sigma:g}_posclean"] = (vx_c - (x1 - x0)).square().mean() / base
         return out
 
@@ -653,16 +825,33 @@ class NVSFMModel(pl.LightningModule):
     # Encode
     # -----------------------------------------------------------------------
 
-    def _encode(self, batch):
-        """Encode a raw image batch → (z_feat, pos_z), optionally normalised."""
+    def _encode_with_start(self, batch):
+        """Encode a raw image batch → (z_feat, pos_z, start), optionally normalised. start is the registers' starting
+        position from the same encoder pass in the flow's space (None unless the model is conditioned on it)."""
         with torch.no_grad():
             input, _ = self.autoencoder.process_data(
                 batch, has_target_image=False, target_has_input=False, compute_rays=True,
             )
-            z_feat, pos_z, _ = self.autoencoder.encode(input)
+            z_feat, pos_z, pos_init = self.autoencoder.encode(input)
+            if self.cond_start and not self._start_checked:
+                # The starting positions must be reproducible from the cameras alone, otherwise the ones used at
+                # generation time (computed from rays) would differ from the ones the flow trained with.
+                ref = self.autoencoder.register_init(input.ray_o, input.ray_d)[1]
+                diff = (ref - pos_init).abs().max().item()
+                print(f"[NVSFMModel] starting positions: max |encode() start - register_init(rays)| = {diff:.2e}"
+                      + ("" if diff < 1e-4 else "  WARNING: not reproducible from the rays alone (jitter?)."))
+                self._start_checked = True
 
+        start = None
+        if self.cond_start:
+            start = self.norm_start(pos_init)
         if self.normaliser is not None:
             pos_z, z_feat = self.normaliser.normalise(pos_z, z_feat)
+        return z_feat, pos_z, start
+
+    def _encode(self, batch):
+        """Encode a raw image batch → (z_feat, pos_z), optionally normalised."""
+        z_feat, pos_z, _ = self._encode_with_start(batch)
         return z_feat, pos_z
 
     # -----------------------------------------------------------------------
@@ -670,8 +859,12 @@ class NVSFMModel(pl.LightningModule):
     # -----------------------------------------------------------------------
 
     def training_step(self, batch, batch_idx):
-        x1, pos1 = self._encode(batch)
+        x1, pos1, start_s = self._encode_with_start(batch)
         B = x1.shape[0]
+        cond = None
+        if self.cond_start:
+            present = (torch.rand(B, device=x1.device) >= self.start_dropout).to(x1.dtype)
+            cond = StartCond(start_s, present)
 
         if self.config.training.train_augm:
             rot  = self.rotation_generator().type_as(pos1)
@@ -681,7 +874,7 @@ class NVSFMModel(pl.LightningModule):
         x0  = torch.randn_like(x1)
         pos0 = torch.randn_like(pos1)
 
-        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t, t_pos)
+        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t, t_pos, start=cond)
         loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
 
         # train/loss is the weighted sum that is optimised; the *_feat / *_pos terms and
@@ -694,11 +887,12 @@ class NVSFMModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x1, pos1 = self._encode(batch)
+        x1, pos1, start_s = self._encode_with_start(batch)
         B = x1.shape[0]
+        cond = StartCond(start_s) if self.cond_start else None      # validation: starting positions given
         t, t_pos = self._sample_times(B, x1.device)
         x0, pos0 = torch.randn_like(x1), torch.randn_like(pos1)
-        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t, t_pos)
+        loss_feat, loss_pos, feat_xhat_mse = self._flow_losses(x1, pos1, x0, pos0, t, t_pos, start=cond)
         loss = self.feat_loss_weight * loss_feat + self.pos_loss_weight * loss_pos
         # val/loss (the checkpoint monitor) is the weighted sum; compare runs with val/loss_unweighted.
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True, batch_size=B)
@@ -706,10 +900,15 @@ class NVSFMModel(pl.LightningModule):
         self.log("val/loss_feat", loss_feat, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/loss_pos", loss_pos, on_step=False, on_epoch=True, logger=True, batch_size=B)
         self.log("val/feat_xhat_mse", feat_xhat_mse, on_step=False, on_epoch=True, logger=True, batch_size=B)
+        if self.cond_start and self.start_dropout > 0:
+            # the same batch with the starting positions hidden: how much do they help?
+            lf_n, lp_n, _ = self._flow_losses(x1, pos1, x0, pos0, t, t_pos, start=StartCond(start_s, torch.zeros(B, device=x1.device)))
+            self.log("val/loss_feat_nostart", lf_n, on_step=False, on_epoch=True, logger=True, batch_size=B)
+            self.log("val/loss_pos_nostart", lp_n, on_step=False, on_epoch=True, logger=True, batch_size=B)
         # Velocity error at fixed noise levels over the no-structure baseline, on the same epochs as the
         # generation statistics (every validation_frequency epochs); logging only.
         if (self.current_epoch + 1) % self.config.training.validation_frequency == 0:
-            for name, value in self._noise_level_ratios(x1, pos1, batch_idx).items():
+            for name, value in self._noise_level_ratios(x1, pos1, batch_idx, start=cond).items():
                 self.log(name, value, on_step=False, on_epoch=True, logger=True, batch_size=B)
         return loss
 
@@ -768,7 +967,10 @@ class NVSFMModel(pl.LightningModule):
             # --- sample generated latents ---
             # Sample more scenes than we render, so the statistics and distances below are less coarse.
             n_stat = 16
-            z_all, pos_all = self.sample(n_stat, sampler=sampler)
+            # A conditioned flow gets the starting positions of validation scenes' cameras (the same cameras that
+            # render the scene below); the first n_scenes are the scenes rendered.
+            cond_val = self._val_cond(n_stat, view_idxs, device) if self.cond_start else None
+            z_all, pos_all = self.sample(n_stat, sampler=sampler, start=cond_val)
             z_gen, pos_gen = z_all[:n_scenes], pos_all[:n_scenes]
 
             # --- statistics of the generated latents, in the flow's own (model) space. With the
@@ -896,30 +1098,50 @@ class NVSFMModel(pl.LightningModule):
         except Exception as e:
             print(f"[warn] validation rendering skipped: {e}")
 
+    @torch.no_grad()
+    def _val_cond(self, n, view_idxs, device):
+        """StartCond for n validation scenes: starting positions from the input cameras (view_idxs) of validation
+        scene i, computed from the rays alone. Cached."""
+        if self._val_start_cache is None or self._val_start_cache.shape[0] != n:
+            ss = []
+            for i in range(n):
+                sd = self.val_dataset.scene_batch(scene_idx=i % len(self.val_dataset), view_indices=view_idxs, device=device)
+                ray_o, ray_d = self.autoencoder.process_data.compute_rays(
+                    sd["c2w"], sd["fxfycxcy"], h=128, w=128, device=device)
+                ss.append(self.start_from_rays(ray_o, ray_d))
+            self._val_start_cache = torch.cat(ss)
+        return StartCond(self._val_start_cache)
+
     # -----------------------------------------------------------------------
     # Sampling
     # -----------------------------------------------------------------------
 
     @torch.no_grad()
-    def sample(self, num_scenes: int, sampler: str = "fm_ode"):
+    def sample(self, num_scenes: int, sampler: str = "fm_ode", start=None):
+        """Generate num_scenes latents (flow space). start: for a flow conditioned on the starting positions, a StartCond
+        or a tensor [num_scenes, N, 3] (flow space, e.g. start_from_rays of validation scenes' cameras); None runs without
+        them, which needs a model trained with start_dropout > 0. Ignored by a model without conditioning."""
         self.eval()
+        cond = self.as_cond(start, num_scenes, next(self.net.parameters()).device)
+        if cond is not None and len(cond) != num_scenes:
+            raise ValueError(f"start has {len(cond)} scenes, expected {num_scenes}")
         compiled_net = self.net
         if hasattr(self.net, "_orig_mod"):
             self.net = self.net._orig_mod
         try:
             if sampler == "fm_ode":
-                return self._sample_fm_ode(num_scenes)
+                return self._sample_fm_ode(num_scenes, cond)
             elif sampler == "edm":
                 if self.time_coupling == "decoupled":
                     raise ValueError("The 'edm' sampler uses one time for positions and features; "
                                      "use 'fm_ode' with time_coupling 'decoupled'.")
-                return self._sample_edm(num_scenes)
+                return self._sample_edm(num_scenes, cond)
             else:
                 raise ValueError(f"Unknown sampler '{sampler}'. Choose 'fm_ode' or 'edm'.")
         finally:
             self.net = compiled_net
 
-    def _sample_fm_ode(self, num_scenes: int):
+    def _sample_fm_ode(self, num_scenes: int, start=None):
         num_steps = self.config.diffusion.num_steps
         order     = self.config.diffusion.get("fm_ode_order", 1)
         device    = next(self.net.parameters()).device
@@ -927,7 +1149,7 @@ class NVSFMModel(pl.LightningModule):
         x   = torch.randn(num_scenes, self.n_tokens, self.scalar_dim, device=device)
         pos = torch.randn(num_scenes, self.n_tokens, 3, device=device)
         if self.time_coupling == "decoupled":
-            return self._integrate_decoupled(x, pos, num_steps)
+            return self._integrate_decoupled(x, pos, num_steps, start=start)
 
         eps = 1e-4
         ts  = torch.linspace(eps, 1.0, num_steps + 1, device=device)
@@ -937,7 +1159,7 @@ class NVSFMModel(pl.LightningModule):
             t_now  = ts[i].expand(num_scenes)
             t_next = ts[i + 1].expand(num_scenes)
 
-            vx, vp = self._velocity(x, pos, t_now)
+            vx, vp = self._velocity(x, pos, t_now, start=start)
             vx = vx.clamp(-10, 10)
             vp = vp.clamp(-10, 10)
 
@@ -947,20 +1169,22 @@ class NVSFMModel(pl.LightningModule):
             else:
                 x_pred   = (x   + dt * vx).clamp(-50, 50)
                 pos_pred = (pos + dt * vp).clamp(-50, 50)
-                vx2, vp2 = self._velocity(x_pred, pos_pred, t_next)
+                vx2, vp2 = self._velocity(x_pred, pos_pred, t_next, start=start)
                 vx2 = vx2.clamp(-10, 10)
                 vp2 = vp2.clamp(-10, 10)
                 x   = x   + dt * 0.5 * (vx  + vx2)
                 pos = pos + dt * 0.5 * (vp  + vp2)
 
-        return x, pos
+        return x, self._state_to_pos(pos, start)
 
-    def _integrate_decoupled(self, x, pos, num_steps):
+    def _integrate_decoupled(self, x, pos, num_steps, start=None):
         """Euler sampler with separate position and feature times (time_coupling 'decoupled').
         Features follow the usual uniform grid t_f. Positions follow t_p = pos_speedup * t_f; at the step where
         t_p would pass 1 / (1 + pos_clean_sigma) they jump to their clean estimate and stay fixed, and the network is
         told t_p = 1 / (1 + pos_clean_sigma) from then on (the situation it saw in training with clean positions).
-        The velocity clamp of the joint sampler is kept."""
+        The velocity clamp of the joint sampler is kept.
+        pos is the position STATE (see _forward_net); the returned positions are converted back with start."""
+        start  = self.as_cond(start, x.shape[0], x.device)
         B      = x.shape[0]
         device = x.device
         eps    = 1e-4
@@ -972,7 +1196,7 @@ class NVSFMModel(pl.LightningModule):
         for i in range(num_steps):
             t_now  = ts[i]
             tp_now = t_cap if pos_done else torch.minimum(lam * t_now, t_cap)
-            vx, vp = self._velocity(x, pos, t_now.expand(B), tp_now.expand(B))
+            vx, vp = self._velocity(x, pos, t_now.expand(B), tp_now.expand(B), start=start)
             vx = vx.clamp(-10, 10)
             vp = vp.clamp(-10, 10)
             x = x + dt * vx
@@ -983,9 +1207,9 @@ class NVSFMModel(pl.LightningModule):
                     pos_done = True
                 else:
                     pos = pos + (tp_next - tp_now) * vp
-        return x, pos
+        return x, self._state_to_pos(pos, start)
 
-    def _sample_edm(self, num_scenes: int):
+    def _sample_edm(self, num_scenes: int, start=None):
         num_steps = self.config.diffusion.num_steps
         sigma_min = self.config.diffusion.sigma_min
         sigma_max = self.config.diffusion.sigma_max
@@ -1016,7 +1240,7 @@ class NVSFMModel(pl.LightningModule):
             t_hat  = (1.0 / (1.0 + sigma_hat)).expand(num_scenes)
             t_next = (1.0 / (1.0 + sigma_next)).expand(num_scenes)
 
-            vx, vp   = self._velocity(x, pos, t_hat)
+            vx, vp   = self._velocity(x, pos, t_hat, start=start)
             t_hat_   = t_hat[:, None, None]
             dx       = x   + (1 - t_hat_) * vx
             dpos     = pos + (1 - t_hat_) * vp
@@ -1025,7 +1249,7 @@ class NVSFMModel(pl.LightningModule):
             pos = pos + (pos - dpos) / sigma_hat * dt_sigma
 
             if sigma_next > 0:
-                vx2, vp2 = self._velocity(x, pos, t_next)
+                vx2, vp2 = self._velocity(x, pos, t_next, start=start)
                 t_next_  = t_next[:, None, None]
                 dx2      = x   + (1 - t_next_) * vx2
                 dpos2    = pos + (1 - t_next_) * vp2
@@ -1034,7 +1258,7 @@ class NVSFMModel(pl.LightningModule):
                 pos = pos + (pos - dpos ) / sigma_hat * dt_sigma * 0.5 \
                           + (pos - dpos2) / sigma_next * dt_sigma * 0.5
 
-        return x, pos
+        return x, self._state_to_pos(pos, start)
 
     # -----------------------------------------------------------------------
     # Rendering
