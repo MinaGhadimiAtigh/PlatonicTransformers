@@ -16,8 +16,15 @@ real feature subspace) or --structure (numbers for crowding and for how consiste
 are, real against generated; use --scenes 64) or --gen-metrics (distribution metrics on rendered views, generated
 against real; use --scenes 128), --real-projection (real features projected onto K principal components),
 --ladder (noise ladder: flow against plain noise of the same size) or --structure --height-split (floor against
-object tokens) to run only that part.
+object tokens) or --position-origin (how far the encoder moves each token from the position it starts at, which the
+input cameras fix) to run only that part.
 Add --split train to use training scenes.
+For a flow conditioned on the starting positions (diffusion.condition_start) generated scenes get the starting positions
+of the cameras of the real scenes of --split (validation scenes by default: the flow never trained on their cameras;
+those same cameras render the generated scene). --no-start generates without them (needs a model trained with
+start_dropout > 0). --copy-train-scenes N (with --gen-metrics and --split val) adds a copy check: how close generated
+views are to the reconstructions of N training scenes, against how close real validation views are. --trace is not
+available for conditioned flows.
 Run from the PlatonicTransformers folder (where mains/ and configs/ are), e.g.
   PYTHONPATH="/media/mina/hdd/amlab/nvsm/PlatonicTransformers:/media/mina/hdd/amlab/nvsm/PlatonicSplats${PYTHONPATH:+:$PYTHONPATH}" \
     python sampler_diagnostics.py \
@@ -80,6 +87,17 @@ def parse_args():
                    help="Feature network for --gen-metrics; 'lowlevel' skips the download and reports the crude descriptor only.")
     p.add_argument("--trace", action="store_true",
                    help="Only trace where the flow leaves the data distribution along sampling paths (fast).")
+    p.add_argument("--position-origin", action="store_true",
+                   help="Only measure how far the autoencoder's encoder moves each latent token from its starting position "
+                        "(which the input cameras fix), over --val-scenes scenes and --rigs camera sets each. No flow is used.")
+    p.add_argument("--no-start", action="store_true",
+                   help="Conditioned flow only: generate WITHOUT the starting positions (needs a model trained with start_dropout > 0).")
+    p.add_argument("--copy-train-scenes", type=int, default=0,
+                   help="With --gen-metrics and --split val: also compare generated views with the reconstructions of this many "
+                        "TRAINING scenes (copy check). 0 = off.")
+    p.add_argument("--rigs", type=int, default=4,
+                   help="With --position-origin: camera sets per scene (the first is the fixed set 0,3,6,9,12, the rest are "
+                        "random 5 of the available views).")
     return p.parse_args()
 
 
@@ -152,9 +170,12 @@ def no_structure_baseline(t):
 
 
 @torch.no_grad()
-def loss_by_noise_level(model, z1, pos1, sigmas, p_mean, p_std, draws=4, chunk=16, seed=0):
-    """Flow loss on real latents at fixed noise levels, split into features and positions."""
+def loss_by_noise_level(model, z1, pos1, sigmas, p_mean, p_std, draws=4, chunk=16, seed=0, start=None):
+    """Flow loss on real latents at fixed noise levels, split into features and positions.
+    start (conditioned flow): starting positions of the scenes, [S, N, 3] in flow space. In offset mode the noise is in the
+    offset state; the position error is reported in position units."""
     gen = torch.Generator(device=z1.device).manual_seed(seed)
+    cond_all = model.as_cond(start, z1.shape[0], z1.device)
     rows = []
     for sigma in sigmas:
         t = 1.0 / (1.0 + sigma)
@@ -163,12 +184,16 @@ def loss_by_noise_level(model, z1, pos1, sigmas, p_mean, p_std, draws=4, chunk=1
         for _ in range(draws):
             for s in range(0, z1.shape[0], chunk):
                 x1, p1 = z1[s:s + chunk], pos1[s:s + chunk]
+                cond = None if cond_all is None else cond_all[s:s + chunk]
+                p1 = model._pos_to_state(p1, cond)
+                _, sc, _ = model._start_parts(cond, x1)
+                sc = 1.0 if sc is None else sc
                 tb = torch.full((x1.shape[0],), t, device=z1.device)
                 t_ = tb[:, None, None]
                 x0 = torch.randn(x1.shape, device=x1.device, generator=gen)
                 p0 = torch.randn(p1.shape, device=x1.device, generator=gen)
-                vx, vp = model._velocity((1 - t_) * x0 + t_ * x1, (1 - t_) * p0 + t_ * p1, tb)
-                ef = (vx - (x1 - x0)).square(); ep = (vp - (p1 - p0)).square()
+                vx, vp = model._velocity((1 - t_) * x0 + t_ * x1, (1 - t_) * p0 + t_ * p1, tb, start=cond)
+                ef = (vx - (x1 - x0)).square(); ep = (sc * (vp - (p1 - p0))).square()
                 w = model._edm_weight(t_)
                 k = x1.shape[0]
                 acc["feat_w"] += (w * ef).mean().item() * k; acc["pos_w"] += (w * ep).mean().item() * k
@@ -206,7 +231,7 @@ def start_scale(sigma0):
 
 
 @torch.no_grad()
-def integrate(model, x, pos, sigmas, heun=False, clamp=None, on_step=None, clip_x1=None):
+def integrate(model, x, pos, sigmas, heun=False, clamp=None, on_step=None, clip_x1=None, start=None):
     """Integrate the learned velocity field from the first noise level in `sigmas` to 0 (t = 1).
 
     Euler, or Heun (second order, no second evaluation on the last step, which would be at t = 1).
@@ -214,6 +239,8 @@ def integrate(model, x, pos, sigmas, heun=False, clamp=None, on_step=None, clip_
     `on_step((i, sigma), x, pos, vx, vp)` is called at the start of every step with the raw velocity.
     `clip_x1` limits the model's clean-feature estimate x1_hat = x + (1-t) v to [-c, c] before stepping
     (the velocity is rebuilt from the clipped estimate; positions are not clipped).
+    start: StartCond of a flow conditioned on the starting positions. `pos` is the flow's position STATE (the position itself
+    unless the flow is in offset mode); convert the result with model._state_to_pos(pos, start).
     """
     ts = torch.tensor(1.0 / (1.0 + np.asarray(sigmas, dtype=np.float64)), dtype=torch.float32, device=x.device)
     b = x.shape[0]
@@ -221,7 +248,7 @@ def integrate(model, x, pos, sigmas, heun=False, clamp=None, on_step=None, clip_
 
     def vel(xx, pp, tt, record=None):
         nonlocal n_eval
-        vx, vp = model._velocity(xx, pp, tt.expand(b))
+        vx, vp = model._velocity(xx, pp, tt.expand(b), start=start)
         n_eval += 1
         if on_step is not None and record is not None:
             on_step(record, xx, pp, vx, vp)
@@ -260,14 +287,17 @@ def sampler_variants(steps, clip=5.0):
 
 
 @torch.no_grad()
-def denoise_from(model, z1, pos1, t0, n_steps, seed=0, on_step=None):
-    """Noise real latents to time t0 (x_t = (1-t0) eps + t0 x1) and integrate back to the data."""
+def denoise_from(model, z1, pos1, t0, n_steps, seed=0, on_step=None, start=None):
+    """Noise real latents to time t0 (x_t = (1-t0) eps + t0 x1) and integrate back to the data.
+    start: starting positions of these scenes for a conditioned flow (tensor [S, N, 3] or StartCond)."""
     gen = torch.Generator(device=z1.device).manual_seed(seed)
+    cond = model.as_cond(start, z1.shape[0], z1.device)
+    p1 = model._pos_to_state(pos1, cond)
     x = (1 - t0) * torch.randn(z1.shape, device=z1.device, generator=gen) + t0 * z1
-    p = (1 - t0) * torch.randn(pos1.shape, device=z1.device, generator=gen) + t0 * pos1
+    p = (1 - t0) * torch.randn(pos1.shape, device=z1.device, generator=gen) + t0 * p1
     sigmas = sigma_grid("karras", max(n_steps // 2, 1), sigma_max=(1 - t0) / t0)
-    xd, pd, _ = integrate(model, x, p, sigmas, heun=True, on_step=on_step)
-    return xd, pd
+    xd, pd, _ = integrate(model, x, p, sigmas, heun=True, on_step=on_step, start=cond)
+    return xd, model._state_to_pos(pd, cond)
 
 
 # ----------------------------------------------------------------------------- images
@@ -447,12 +477,18 @@ def build_scene_context(model, ae, dataset, device, edict, n=4):
         sd = dataset.scene_batch(scene_idx=int(dataset.scene_indices[i]), view_indices=VIEW_IDXS, device=device)
         ray_o, ray_d = ae.process_data.compute_rays(sd["c2w"], sd["fxfycxcy"], h=IMAGE_HW[0], w=IMAGE_HW[1], device=device)
         enc = edict({"image": sd["image"], "ray_o": ray_o, "ray_d": ray_d, "image_h_w": IMAGE_HW})
-        z, p, _ = ae.encode(enc)
+        z, p, s0 = ae.encode(enc)
         if model.normaliser is not None:
             p, z = model.normaliser.normalise(p, z)
-        ctx.append({"ray_o": ray_o, "ray_d": ray_d, "z": z, "pos": p,
+        ctx.append({"ray_o": ray_o, "ray_d": ray_d, "z": z, "pos": p, "start": model.norm_start(s0),
                     "recon": model.render(z, p, ray_o, ray_d, IMAGE_HW)[0]})
     return ctx
+
+
+def ctx_starts(ctx, n):
+    """Starting positions (flow space) of the input cameras of scene i % len(ctx), for n scenes: [n, N, 3].
+    The same cameras render the generated scene i, so latent and cameras share one frame."""
+    return torch.cat([ctx[i % len(ctx)]["start"] for i in range(n)])
 
 
 @torch.no_grad()
@@ -606,22 +642,25 @@ def run_pca_test(model, ctx, generated, z_real, out_dir, ks=(16, 32, 64, 128)):
 
 
 @torch.no_grad()
-def generate_samples(model, n, steps, seed, device):
-    """Two generated batches from the same starting noise: the current sampler and the clipped Karras one."""
+def generate_samples(model, n, steps, seed, device, start=None):
+    """Two generated batches from the same starting noise: the current sampler and the clipped Karras one.
+    start: starting positions of the n scenes' cameras for a conditioned flow ([n, N, 3] flow space or StartCond);
+    None runs without them (needs start_dropout > 0)."""
     gen = torch.Generator(device=device).manual_seed(seed)
+    cond = model.as_cond(start, n, device)
     base_x = torch.randn(n, model.n_tokens, model.scalar_dim, device=device, generator=gen)
     base_p = torch.randn(n, model.n_tokens, 3, device=device, generator=gen)
     if getattr(model, "time_coupling", "joint") == "decoupled":
         # the model's own sampler: positions run ahead of features (one sampler only; the other variants
         # assume one time for positions and features)
-        zg, pg = model._integrate_decoupled(base_x, base_p, steps)
+        zg, pg = model._integrate_decoupled(base_x, base_p, steps, start=cond)
         return [("current: decoupled times, positions first, Euler, clamp 10", zg, pg)]
     variants = sampler_variants(steps)
     out = []
     for name, sigmas_, heun, clamp, clip in (variants[0], variants[-1]):
         s0 = start_scale(sigmas_[0])
-        zg, pg, _ = integrate(model, base_x * s0, base_p * s0, sigmas_, heun=heun, clamp=clamp, clip_x1=clip)
-        out.append((name, zg, pg))
+        zg, pg, _ = integrate(model, base_x * s0, base_p * s0, sigmas_, heun=heun, clamp=clamp, clip_x1=clip, start=cond)
+        out.append((name, zg, model._state_to_pos(pg, cond)))
     return out
 
 
@@ -681,13 +720,15 @@ def _mean_sd(a):
     return float(np.mean(a)), float(np.std(a))
 
 
-def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir, height_split=False):
+def run_structure(model, z1, pos1, steps, seed, n_gen, device, out_dir, height_split=False, s1=None):
     slot_mean = z1.mean(dim=0, keepdim=True)
     edges = distance_edges(pos1)
     rows = [("real validation latents", structure_metrics(z1, pos1, slot_mean, edges))]
     gens = {}
     for c in range(0, n_gen, 16):
-        out = generate_samples(model, min(16, n_gen - c), steps, seed + c, device)
+        m_ = min(16, n_gen - c)
+        st = None if s1 is None else s1[torch.arange(c, c + m_, device=s1.device) % len(s1)]   # cameras of real scene i
+        out = generate_samples(model, m_, steps, seed + c, device, start=st)
         for k, (name, zg, pg) in enumerate(out):
             gens.setdefault(k, (name, [], []))
             gens[k][1].append(zg); gens[k][2].append(pg)
@@ -849,19 +890,24 @@ def view_similarity_gap(feats, n_views):
 
 
 @torch.no_grad()
-def run_gen_metrics(model, ctx, n_gen, steps, seed, device, out_dir, feature_net="auto"):
+def run_gen_metrics(model, ctx, n_gen, steps, seed, device, out_dir, feature_net="auto", use_start=True, train_ref=None):
     """Distribution metrics on RENDERED views: generated scenes against the autoencoder's reconstructions of real scenes.
 
     Reference images are the autoencoder reconstructions of the real scenes in `ctx` (same decoder as the generated
     ones, so decoder blur cancels; the numbers measure the gap in the latent distribution, not the decoder).
-    Generated scene i is rendered with the cameras of real scene i (modulo the number of real scenes).
+    Generated scene i is rendered with the cameras of real scene i (modulo the number of real scenes); a flow conditioned on
+    the starting positions gets those cameras' starting positions (use_start False: none, needs start_dropout > 0).
+    train_ref: reconstructions of TRAINING scenes' views [M, 3, H, W] for the copy check (run with real scenes from the
+    validation split): how close generated views are to training views, against how close real validation views are.
     """
     n_real = len(ctx)
     ref = torch.cat([c["recon"] for c in ctx])                  # [n_real * V, 3, H, W]
     n_views = ctx[0]["recon"].shape[0]
     zs, ps, name = [], [], None
+    starts = ctx_starts(ctx, n_gen) if (getattr(model, "cond_start", False) and use_start) else None
     for c in range(0, n_gen, 16):
-        out = generate_samples(model, min(16, n_gen - c), steps, seed + c, device)
+        m_ = min(16, n_gen - c)
+        out = generate_samples(model, m_, steps, seed + c, device, start=None if starts is None else starts[c:c + m_])
         name, zg, pg = out[0]                                    # the run's own sampler
         zs.append(zg); ps.append(pg)
     zg, pg = torch.cat(zs), torch.cat(ps)
@@ -884,12 +930,14 @@ def run_gen_metrics(model, ctx, n_gen, steps, seed, device, out_dir, feature_net
     ll = ((ll - mu) / sd_).clamp(-10, 10)
     spaces.append(("low-level colour/edge/layout descriptor", ll[:len(ref)], ll[len(ref):], ll[:len(ref)][ref_idx(half == 0)],
                    ll[:len(ref)][ref_idx(half == 1)]))
+    ft = None
     deep_name, deep = load_deep_features(device, feature_net)
     if deep_name is None:
         print("  deep features not used" + (" (" + "; ".join(deep) + ")" if deep else " (--feature-net lowlevel)") + "; only the low-level metrics are reported.")
         results["deep_feature_error"] = deep
     else:
         fr = _extract(deep, ref); fg = _extract(deep, gen)
+        ft = None if train_ref is None else _extract(deep, train_ref)
         spaces.append((deep_name, fr, fg, fr[ref_idx(half == 0)], fr[ref_idx(half == 1)]))
 
     results["spaces"] = {}
@@ -910,6 +958,16 @@ def run_gen_metrics(model, ctx, n_gen, steps, seed, device, out_dir, feature_net
         print(f"    nearest real image, cosine similarity: generated {float(nn_gen.mean()):.3f}, real-to-real floor {float(nn_floor.mean()):.3f}; "
               f"{100 * float((nn_gen > thr).float().mean()):.1f}% of generated views are closer than the floor's 95th percentile (copies would be near 100%)")
         print(f"    views of one scene: similarity within {w_r:.3f} / between {b_r:.3f} / gap {g_r:.3f} for real; {w_g:.3f} / {b_g:.3f} / {g_g:.3f} for generated")
+        if ft is not None and sname == deep_name:
+            nn_gt = nearest_similarity(fg, ft); nn_rt = nearest_similarity(fr, ft)
+            thr_t = float(torch.quantile(nn_rt, 0.95)); share_t = float((nn_gt > thr_t).float().mean())
+            results["spaces"][sname]["copy_check_vs_training_views"] = {
+                "n_training_views": int(len(ft)), "nearest_training_similarity_generated": float(nn_gt.mean()),
+                "nearest_training_similarity_real_validation": float(nn_rt.mean()),
+                "share_generated_above_real_validation_95th_percentile": share_t}
+            print(f"    COPY CHECK against {len(ft)} training views: nearest training view, cosine similarity: generated {float(nn_gt.mean()):.3f}, "
+                  f"real validation views {float(nn_rt.mean()):.3f}; {100 * share_t:.1f}% of generated views are closer than the real validation "
+                  f"views' 95th percentile (about 5% is expected without copying; copies push the generated similarity up and this share towards 100%)")
 
     sr, sg = image_scalars(ref), image_scalars(gen)
     print("\n  Image statistics (mean, sd over views):    real          generated")
@@ -991,7 +1049,7 @@ def run_real_projection(model, ctx, out_dir, ks=(16, 32, 64, 128)):
 
 # ----------------------------------------------------------------------------- noise ladder
 @torch.no_grad()
-def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s=(0.9, 0.7, 0.5, 0.3, 0.1), chunk=16):
+def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s=(0.9, 0.7, 0.5, 0.3, 0.1), chunk=16, use_start=True):
     """Where does the flow lose 'realness', and is that the flow or the decoder?
 
     Real latents of the even-numbered scenes are noised to time t0 and denoised by the flow (t0 0.9 = light noise,
@@ -1010,6 +1068,7 @@ def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s
     f_ref = _extract(fn, ref)
     floor = kid_score(f_ref, _extract(fn, ref_even), seed=seed)
     zA = torch.cat([c["z"] for c in even]); pA = torch.cat([c["pos"] for c in even])
+    sA = torch.cat([c["start"] for c in even]) if (getattr(model, "cond_start", False) and use_start) else None
     gen = torch.Generator(device=device).manual_seed(seed)
 
     def render_all(zs, ps):
@@ -1023,7 +1082,8 @@ def run_ladder(model, ctx, steps, seed, device, out_dir, feature_net="auto", t0s
     for t0 in t0s:
         zs, ps = [], []
         for s in range(0, len(zA), chunk):
-            zd, pd = denoise_from(model, zA[s:s + chunk], pA[s:s + chunk], t0, steps, seed=seed + s)
+            zd, pd = denoise_from(model, zA[s:s + chunk], pA[s:s + chunk], t0, steps, seed=seed + s,
+                                  start=None if sA is None else sA[s:s + chunk])
             zs.append(zd); ps.append(pd)
         zd, pd = torch.cat(zs), torch.cat(ps)
         err_f = float((zd - zA).square().mean().sqrt()); err_p = float((pd - pA).square().mean().sqrt())
@@ -1143,6 +1203,238 @@ def run_height_split(z1, pos1, slot_mean, gen_sets, out_dir):
 
 
 # ----------------------------------------------------------------------------- main
+# ----------------------------------------------------------------------------- position origin
+N_RAY_TOKENS = 240        # tokens 0..239 start on the input rays (5 views x 48); the last 16 start at the scene centre
+VIEW_SIZE = 48
+
+
+def _fmt(x, nd=3):
+    return "n/a" if x is None else f"{x:.{nd}f}"
+
+
+def anova_within_share(v):
+    """v: [S, R, T, 3] (scene, camera set, token, axis). Share of the per-token variance that differs between camera
+    sets of the same scene (within-scene), by a one-way variance decomposition, summed over tokens and axes."""
+    v = v.double()
+    S, R = v.shape[:2]
+    within = v.var(dim=1, unbiased=True).mean(dim=0)                       # [T,3]
+    between = (v.mean(dim=1).var(dim=0, unbiased=True) - within / R).clamp_min(0)
+    tot = (within + between).sum()
+    return float(within.sum() / tot) if tot > 0 else float("nan")
+
+
+def pos_structure(P, view_size=VIEW_SIZE, near_k=4):
+    """P: [S, R, N, 3]. Nearest-token distances and how many of the nearest tokens come from the same view slot."""
+    S, R, N, _ = P.shape
+    x = P.reshape(S * R, N, 3).double()
+    d = torch.cdist(x, x)
+    d.diagonal(dim1=1, dim2=2).fill_(float("inf"))
+    srt, idx = torch.sort(d, dim=2)
+    slot = torch.clamp(torch.arange(N) // view_size, max=N // view_size)
+    nn_slot = slot[idx[:, :, :near_k]]                                      # [M,N,k]
+    same = (nn_slot == slot[None, :, None]).double().mean().item()
+    other1 = (slot[idx[:, :, 0]] != slot[None, :]).double().mean().item()
+    return {"nn1": srt[:, :, 0].mean().item(), "nn5": srt[:, :, min(4, N - 2)].mean().item(),
+            "near_same_view_frac": same, "nearest_from_other_view_frac": other1}
+
+
+def position_origin_stats(P, P0, n_ray=N_RAY_TOKENS, view_size=VIEW_SIZE):
+    """P, P0: [S, R, N, 3], final and starting token positions in the flow's normalised space (real rms about 1).
+
+    Per token group: size of the move |P - P0|, and how much of the spread of P the start explains, three ways
+    (start used as is; one global linear map; a separate linear fit per token and axis, the most generous)."""
+    P, P0 = P.double(), P0.double()
+    S, R, N, _ = P.shape
+    n_ray = min(n_ray, N)
+    groups = {"ray": slice(0, n_ray)}
+    if N > n_ray:
+        groups["centre"] = slice(n_ray, N)
+    out = {"scenes": S, "camera_sets": R, "tokens": N, "groups": {}}
+    for name, sl in groups.items():
+        p, p0 = P[:, :, sl], P0[:, :, sl]
+        dlt = p - p0
+        dn = dlt.norm(dim=-1)
+        tot = (p - p.reshape(-1, 3).mean(0)).square().sum(-1).mean()
+        ex_unit = 1 - dlt.square().sum(-1).mean() / tot
+        ones = torch.ones(p0.reshape(-1, 3).shape[0], 1, dtype=p.dtype)
+        X, Y = torch.cat([p0.reshape(-1, 3), ones], 1), p.reshape(-1, 3)
+        coef = torch.linalg.lstsq(X, Y).solution
+        ex_lin = 1 - (Y - X @ coef).square().sum(-1).mean() / tot
+        x = p0.reshape(S * R, -1, 3); y = p.reshape(S * R, -1, 3)
+        xm, ym = x.mean(0), y.mean(0)
+        varx = (x - xm).square().mean(0)
+        alpha = torch.where(varx > 1e-10, ((x - xm) * (y - ym)).mean(0) / varx.clamp_min(1e-10), torch.zeros_like(varx))
+        sse = ((y - ym) - alpha * (x - xm)).square().sum(-1).mean()
+        ex_slot = 1 - sse / tot
+        out["groups"][name] = {
+            "tokens": int(p.shape[2]),
+            "final_spread_rms": float((tot / 3).sqrt()),          # per coordinate, like the other flow-space numbers
+            "start_spread_rms": float(((p0 - p0.reshape(-1, 3).mean(0)).square().sum(-1).mean() / 3).sqrt()),
+            "move_rms": float((dlt.square().sum(-1).mean() / 3).sqrt()),   # per coordinate
+            "move_over_spread": float((dlt.square().sum(-1).mean() / tot).sqrt()),
+            "move_median": float(dn.median()), "move_p90": float(dn.reshape(-1).quantile(0.9)),   # distances (3D)
+            "explained_unit_slope": float(ex_unit), "explained_global_linear": float(ex_lin),
+            "explained_per_token_linear": float(ex_slot),
+            "camera_set_share_final": anova_within_share(p) if R > 1 and S > 1 else None,
+            "camera_set_share_start": anova_within_share(p0) if R > 1 and S > 1 else None,
+        }
+    out["structure_final"] = pos_structure(P, view_size)
+    out["structure_start"] = pos_structure(P0, view_size)
+    return out
+
+
+def position_origin_verdict(stats, move_build=0.3, share_build=0.9, move_drop=0.6, share_drop=0.7):
+    g = stats["groups"]["ray"]
+    if g["move_rms"] < move_build and g["explained_unit_slope"] >= share_build:
+        return "BUILD: the cameras fix most of the position structure (move below %.1f and share at least %.0f%%)" % (move_build, 100 * share_build)
+    if g["move_rms"] >= move_drop or g["explained_unit_slope"] < share_drop:
+        return "DROP: the encoder creates most of the position structure (move %.1f or more, or share below %.0f%%)" % (move_drop, 100 * share_drop)
+    return "BETWEEN the thresholds: neither clearly camera-determined nor clearly encoder-created"
+
+
+def ray_split(patch_fn, patch_size, ray_o, ray_d, p_raw, p0_raw, n_ray=N_RAY_TOKENS, view_size=VIEW_SIZE):
+    """Split the move of each ray token into the part along its ray and the part across it (autoencoder frame).
+
+    The ray of a token is found as the patch-mean ray of its assumed view slot that best matches the direction from
+    that view's camera to the token's start position; the same match is checked against all five views."""
+    o_pm, d_pm = patch_fn(ray_o, ray_d, patch_size)
+    if o_pm.dim() != 3 or d_pm.dim() != 4 or o_pm.shape[-1] != 3 or d_pm.shape[-1] != 3:
+        raise ValueError(f"unexpected patch_mean_rays shapes {tuple(o_pm.shape)} and {tuple(d_pm.shape)}")
+    o = o_pm[0].double().cpu(); d = d_pm[0].double().cpu()
+    d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    V = o.shape[0]
+    T = min(n_ray, V * view_size)
+    p0 = p0_raw[0, :T].double().cpu(); p = p_raw[0, :T].double().cpu()
+    slot = torch.arange(T) // view_size
+    diff = p0[:, None, :] - o[None]                                         # [T,V,3]
+    unit = diff / diff.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    cos = torch.einsum("tvc,vkc->tvk", unit, d)                             # [T,V,Np]
+    best, arg = cos.max(dim=-1)                                             # [T,V]
+    cos_assumed = best[torch.arange(T), slot]
+    ok = (best.argmax(dim=1) == slot).double().mean().item()
+    u = d[slot, arg[torch.arange(T), slot]]                                 # [T,3]
+    delta = p - p0
+    par = (delta * u).sum(-1)
+    perp = delta - par[:, None] * u
+    return {"par2": par.square().sum().item(), "perp2": perp.square().sum().item(), "n": T,
+            "cos_assumed_median": cos_assumed.median().item(), "slot_match": ok}
+
+
+@torch.no_grad()
+def collect_position_origin(model, ae, dataset, device, edict, n_scenes, rigs, seed, patch_fn=None):
+    """Encode n_scenes scenes under `rigs` camera sets each; return final and starting positions in the flow's space."""
+    rng = np.random.RandomState(seed)
+    try:
+        n_avail = int(dataset.c2w[int(dataset.scene_indices[0])].shape[0])
+    except Exception:
+        n_avail = 16
+        print("  (could not read the number of views per scene; assuming 16)")
+    n_scenes = min(n_scenes, len(dataset))
+    norm = getattr(model, "normaliser", None)
+    scale = float(norm.pos_scale) if norm is not None else 1.0
+    Ps, P0s, vis, split_acc, split_err = [], [], [], {"par2": 0.0, "perp2": 0.0, "n": 0, "cos": [], "match": []}, None
+    for i in range(n_scenes):
+        sidx = int(dataset.scene_indices[i])
+        sets = [list(VIEW_IDXS)] + [sorted(rng.choice(n_avail, size=len(VIEW_IDXS), replace=False).tolist()) for _ in range(rigs - 1)]
+        rows_p, rows_p0 = [], []
+        for views in sets:
+            sd_ = dataset.scene_batch(scene_idx=sidx, view_indices=views, device=device)
+            ray_o, ray_d = ae.process_data.compute_rays(sd_["c2w"], sd_["fxfycxcy"], h=IMAGE_HW[0], w=IMAGE_HW[1], device=device)
+            enc = edict({"image": sd_["image"], "ray_o": ray_o, "ray_d": ray_d, "image_h_w": IMAGE_HW})
+            z, p, p0 = ae.encode(enc)
+            if norm is not None:
+                pn, _ = norm.normalise(p, z); p0n, _ = norm.normalise(p0, z)
+            else:
+                pn, p0n = p, p0
+            rows_p.append(pn[0].float().cpu()); rows_p0.append(p0n[0].float().cpu())
+            if patch_fn is not None and split_err is None:
+                try:
+                    r = ray_split(patch_fn, getattr(ae, "patch_size", 8), ray_o, ray_d, p, p0)
+                    split_acc["par2"] += r["par2"]; split_acc["perp2"] += r["perp2"]; split_acc["n"] += r["n"]
+                    split_acc["cos"].append(r["cos_assumed_median"]); split_acc["match"].append(r["slot_match"])
+                except Exception as e:                                       # optional part: never stop the main result
+                    split_err = f"{type(e).__name__}: {e}"
+        Ps.append(torch.stack(rows_p)); P0s.append(torch.stack(rows_p0))
+        vis.append(sets[0])
+    return torch.stack(Ps), torch.stack(P0s), scale, split_acc, split_err
+
+
+def plot_position_origin(P, P0, path, n_scenes=2, view_size=VIEW_SIZE):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
+    except Exception as e:
+        print(f"  (no figure: {e})")
+        return False
+    n = min(n_scenes, P.shape[0])
+    fig, axes = plt.subplots(n, 2, figsize=(10, 4.6 * n), squeeze=False)
+    cols = plt.get_cmap("tab10")
+    N = P.shape[2]
+    slot = np.clip(np.arange(N) // view_size, 0, N // view_size)
+    for r in range(n):
+        p, p0 = P[r, 0].numpy(), P0[r, 0].numpy()
+        for c, (a, b, lab) in enumerate([(0, 1, "x against y (from above)"), (0, 2, "x against z (from the side)")]):
+            ax = axes[r, c]
+            segs = [[(p0[j, a], p0[j, b]), (p[j, a], p[j, b])] for j in range(N)]
+            ax.add_collection(LineCollection(segs, colors=[cols(s) if s < 5 else "black" for s in slot], linewidths=0.8, alpha=0.7))
+            ax.scatter(p0[:, a], p0[:, b], s=5, c="0.6", zorder=3)
+            ax.scatter(p[:, a], p[:, b], s=9, c=[cols(s) if s < 5 else "black" for s in slot], zorder=4)
+            ax.set_aspect("equal"); ax.autoscale(); ax.set_title(f"scene {r}, fixed camera set: {lab}", fontsize=10)
+            ax.set_xlabel("flow units"); ax.grid(alpha=0.2)
+    fig.suptitle("Token positions: start (grey) to final (colour = input view; black = centre tokens)", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return True
+
+
+def run_position_origin(model, ae, dataset, device, edict, n_scenes, rigs, seed, out_dir, patch_fn=None):
+    P, P0, scale, split_acc, split_err = collect_position_origin(model, ae, dataset, device, edict, n_scenes, rigs, seed, patch_fn)
+    stats = position_origin_stats(P, P0)
+    S, R = P.shape[:2]
+    print(f"\nPosition origin: {S} scenes x {R} camera sets each (the first is the fixed set {VIEW_IDXS}, the others are random sorted 5 of the available views).")
+    print("Positions are in the flow's space (rms 1 per coordinate, the same units as the flow's position errors: 0.05 per coordinate is what the decoder needs for 30 dB).")
+    print("'move' = how far the encoder moves a token from its starting position; 'rms' is per coordinate, 'median' and '90th percentile' are 3D distances.")
+    names = {"ray": "ray tokens (first 240, start on the input rays)", "centre": "centre tokens (last 16)"}
+    for k, g in stats["groups"].items():
+        print(f"\n  {names.get(k, k)}: {g['tokens']} tokens; spread per coordinate of the final positions {g['final_spread_rms']:.3f}, of the starting positions {g['start_spread_rms']:.3f}")
+        print(f"    move: rms {g['move_rms']:.3f} per coordinate ({100 * g['move_over_spread']:.0f}% of the spread), median distance {g['move_median']:.3f}, 90th percentile {g['move_p90']:.3f}")
+        print(f"    share of the final positions' spread explained by the start: as is {100 * g['explained_unit_slope']:.1f}%, "
+              f"one global linear map {100 * g['explained_global_linear']:.1f}%, a linear fit per token and axis {100 * g['explained_per_token_linear']:.1f}%")
+        if g["camera_set_share_final"] is not None:
+            print(f"    share of the position variance that differs between camera sets of the same scene: final {100 * g['camera_set_share_final']:.1f}%, start {100 * g['camera_set_share_start']:.1f}%")
+    sf, ss = stats["structure_final"], stats["structure_start"]
+    print("\n  Arrangement of all tokens (chance for the same-view share is about 0.18; real latents earlier: nn1 0.180, nn5 0.439, same-view 0.124):")
+    print(f"    {'':8s} {'nn1':>7s} {'nn5':>7s} {'same view':>10s} {'nearest from another view':>26s}")
+    for lab, s_ in (("final", sf), ("start", ss)):
+        print(f"    {lab:8s} {s_['nn1']:7.3f} {s_['nn5']:7.3f} {s_['near_same_view_frac']:10.3f} {s_['nearest_from_other_view_frac']:26.3f}")
+    along = None
+    if split_acc["n"] > 0:
+        tot = split_acc["par2"] + split_acc["perp2"]
+        along = {"share_of_squared_move_along_ray": split_acc["par2"] / tot if tot > 0 else None,
+                 "rms_along": math.sqrt(split_acc["par2"] / split_acc["n"]) / scale,                 # one direction
+                 "rms_across_per_direction": math.sqrt(split_acc["perp2"] / (2 * split_acc["n"])) / scale,   # two directions
+                 "median_cos_start_to_ray": float(np.median(split_acc["cos"])), "view_slot_match": float(np.mean(split_acc["match"]))}
+        print(f"\n  Move along the token's ray against across it (flow units): along {along['rms_along']:.3f} (one direction), across {along['rms_across_per_direction']:.3f} per direction (two directions); "
+              f"{100 * along['share_of_squared_move_along_ray']:.1f}% of the squared move is along the ray.")
+        print(f"    check of the token-to-view assumption: the start lies on its assumed view's ray (median cosine {along['median_cos_start_to_ray']:.4f}); "
+              f"the best-matching view is the assumed one for {100 * along['view_slot_match']:.1f}% of tokens (should be near 100%).")
+    elif split_err:
+        print(f"\n  (along/across split skipped: {split_err})")
+    verdict = position_origin_verdict(stats)
+    print(f"\n  Proposed rule (thresholds are proposals) on the ray tokens: {verdict}")
+    drawn = plot_position_origin(P, P0, out_dir / "9_position_origin.png")
+    stats["along_across"] = along
+    stats["verdict"] = verdict
+    stats["view_sets_first"] = VIEW_IDXS
+    stats["figure"] = bool(drawn)
+    (out_dir / "position_origin.json").write_text(json.dumps(stats, indent=2, allow_nan=True, default=float) + "\n")
+    return stats
+
+
+
 def choose_checkpoint(directory):
     candidates = sorted(Path(directory).glob("*.pt"))   # same ordering as PlatonicAutoencoder.load_ckpt
     if not candidates:
@@ -1204,10 +1496,25 @@ def main():
         raise RuntimeError(f"Checkpoint was trained with diffusion.time_coupling='{saved_coupling}' but --config says "
                            f"'{config_coupling}'. Use the config the run was trained with.")
     print(f"Time coupling: {config_coupling}")
-    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics or args.real_projection):
+    mine_c = model._conditioning_state()
+    saved_c = ckpt.get("conditioning", {"start": False, "mode": "input", "dropout_on": False, "offset_scale": mine_c["offset_scale"]})
+    if saved_c["start"] != mine_c["start"] or (mine_c["start"] and (
+            saved_c["mode"] != mine_c["mode"] or saved_c["dropout_on"] != mine_c["dropout_on"]
+            or (mine_c["mode"] == "offset" and abs(saved_c["offset_scale"] - mine_c["offset_scale"]) > 1e-9))):
+        raise RuntimeError(f"Checkpoint was trained with conditioning {saved_c} but --config says {mine_c}. Use the config the run was trained with.")
+    if model.cond_start:
+        print(f"Conditioning on the starting positions: mode {model.start_mode}, start dropout {model.start_dropout:g}")
+    use_start = bool(model.cond_start) and not args.no_start
+    if args.no_start and not model.cond_start:
+        print("(--no-start ignored: this flow is not conditioned on the starting positions)")
+    if args.copy_train_scenes and not args.gen_metrics:
+        raise RuntimeError("--copy-train-scenes belongs to --gen-metrics.")
+    if args.copy_train_scenes and args.split != "val":
+        raise RuntimeError("--copy-train-scenes compares with training scenes, so the real scenes must come from --split val.")
+    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics or args.real_projection or args.position_origin):
         raise RuntimeError("This checkpoint uses separate times for positions and features. The default mode and --trace "
                            "assume one time for both and are not valid for it; use --structure, --swap-test, "
-                           "--pca-test, --decoder-tolerance, --gen-metrics or --real-projection.")
+                           "--pca-test, --decoder-tolerance, --gen-metrics, --real-projection or --position-origin.")
     info = load_flow_weights(model, ckpt, args.weights, fm.LatentNormaliser)
     del ckpt
     model.to(device).eval()
@@ -1220,18 +1527,22 @@ def main():
         # ---- real validation latents (the reference) ----
         n_val = min(args.val_scenes, len(val_set))
         positions = np.unique(np.linspace(0, len(val_set) - 1, n_val).round().astype(int))
-        zs, ps = [], []
+        zs, ps, ss = [], [], []
         for s in range(0, len(positions), 8):
             batch = default_collate([val_set[int(i)] for i in positions[s:s + 8]])
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-            z, p = model._encode(batch)                # normalised like training
-            zs.append(z); ps.append(p)
+            z, p, s_ = model._encode_with_start(batch)  # normalised like training
+            zs.append(z); ps.append(p); ss.append(s_)
         z1, pos1 = torch.cat(zs), torch.cat(ps)
+        s1 = torch.cat(ss) if model.cond_start else None   # starting positions of these real scenes (conditioned flow)
+        S1 = s1 if use_start else None
         real_stats = latent_stats(z1, pos1)
         print(f"\nReal {args.split} latents ({len(z1)} scenes) in the flow's space:")
         print("  " + "  ".join(f"{k}={v:.3f}" for k, v in real_stats.items()))
 
         if args.trace:
+            if model.cond_start:
+                raise RuntimeError("--trace is not available for a flow conditioned on the starting positions.")
             out_dir = args.out_dir.expanduser().resolve() / ("trace_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
             run_trace(model, z1, pos1, args.steps, args.seed, out_dir)
@@ -1249,7 +1560,8 @@ def main():
             out_dir = args.out_dir.expanduser().resolve() / ("swap_test_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
             ctx = build_scene_context(model, ae, val_set, device, edict)
-            generated = generate_samples(model, len(ctx), args.steps, args.seed, device)
+            generated = generate_samples(model, len(ctx), args.steps, args.seed, device,
+                                         start=ctx_starts(ctx, len(ctx)) if use_start else None)
             run_swap_test(model, ctx, generated, z1.mean(dim=0, keepdim=True), out_dir)
             print(f"\nSaved 4_swap_test.png and swap_test.json in {out_dir}")
             return
@@ -1257,8 +1569,20 @@ def main():
         if args.structure:
             out_dir = args.out_dir.expanduser().resolve() / ("structure_test_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
-            run_structure(model, z1, pos1, args.steps, args.seed, args.scenes, device, out_dir, height_split=args.height_split)
+            run_structure(model, z1, pos1, args.steps, args.seed, args.scenes, device, out_dir, height_split=args.height_split, s1=S1)
             print(f"\nSaved structure_test.json in {out_dir}")
+            return
+
+        if args.position_origin:
+            out_dir = args.out_dir.expanduser().resolve() / ("position_origin_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            try:
+                from psplat.models.modules.patchify import patch_mean_rays as patch_fn
+            except Exception as e:
+                print(f"  (patch_mean_rays not importable, along/across split skipped: {e})")
+                patch_fn = None
+            run_position_origin(model, ae, val_set, device, edict, args.val_scenes, max(1, args.rigs), args.seed, out_dir, patch_fn)
+            print(f"\nSaved 9_position_origin.png and position_origin.json in {out_dir}")
             return
 
         if args.real_projection:
@@ -1275,7 +1599,7 @@ def main():
             out_dir = args.out_dir.expanduser().resolve() / ("noise_ladder_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
             ctx = build_scene_context(model, ae, val_set, device, edict, n=min(args.val_scenes, len(val_set)))
-            run_ladder(model, ctx, args.steps, args.seed, device, out_dir, feature_net=args.feature_net)
+            run_ladder(model, ctx, args.steps, args.seed, device, out_dir, feature_net=args.feature_net, use_start=use_start)
             print(f"\nSaved 8_noise_ladder.png and noise_ladder.json in {out_dir}")
             return
 
@@ -1283,8 +1607,19 @@ def main():
             out_dir = args.out_dir.expanduser().resolve() / ("gen_metrics_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
             ctx = build_scene_context(model, ae, val_set, device, edict, n=min(args.val_scenes, len(val_set)))
+            train_ref = None
+            if args.copy_train_scenes:
+                train_ds = train_loader.dataset
+                if isinstance(train_ds, fm.RepeatedDataset):
+                    train_ds = train_ds.dataset
+                if not hasattr(train_ds, "scene_batch"):
+                    raise RuntimeError("Training set is a subset wrapper; run with dataset_fraction: 1.0 to use --copy-train-scenes.")
+                tctx = build_scene_context(model, ae, train_ds, device, edict, n=min(args.copy_train_scenes, len(train_ds)))
+                train_ref = torch.cat([c["recon"] for c in tctx])
+                print(f"Copy check reference: reconstructions of {len(tctx)} training scenes ({len(train_ref)} views).")
             run_gen_metrics(model, ctx, args.scenes, args.steps, args.seed, device, out_dir,
-                            feature_net="lowlevel" if args.feature_net == "lowlevel" else args.feature_net)
+                            feature_net="lowlevel" if args.feature_net == "lowlevel" else args.feature_net,
+                            use_start=use_start, train_ref=train_ref)
             print(f"\nSaved 6_gen_metrics_scenes.png and gen_metrics.json in {out_dir}")
             return
 
@@ -1292,14 +1627,15 @@ def main():
             out_dir = args.out_dir.expanduser().resolve() / ("pca_test_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             out_dir.mkdir(parents=True, exist_ok=False)
             ctx = build_scene_context(model, ae, val_set, device, edict)
-            generated = generate_samples(model, len(ctx), args.steps, args.seed, device)
+            generated = generate_samples(model, len(ctx), args.steps, args.seed, device,
+                                         start=ctx_starts(ctx, len(ctx)) if use_start else None)
             run_pca_test(model, ctx, generated, z1, out_dir)
             print(f"\nSaved 5_feature_subspace.png and feature_subspace.json in {out_dir}")
             return
 
         # ---- loss by noise level ----
         sigmas = [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
-        binned = loss_by_noise_level(model, z1, pos1, sigmas, p_mean, p_std)
+        binned = loss_by_noise_level(model, z1, pos1, sigmas, p_mean, p_std, start=S1)
         print("\nFlow loss by noise level on real latents (ratio < 1 = better than a no-structure estimator):")
         print("  sigma | share of training at least this noisy | loss feat / pos | ratio feat / pos")
         for r in binned:
@@ -1322,9 +1658,11 @@ def main():
         print(f"\nGeneration with {n_gen} scenes per sampler (same starting noise):")
         print("  sampler | evals | feat std | feat |x|>5 | pos rms | clamp active")
         print(f"  {'real latents (reference)':52s} |       | {real_stats['feat_std']:.3f} | {100 * real_stats['frac_abs_gt_5']:.2f}% | {real_stats['pos_rms']:.3f} |")
+        cond_gen = model.as_cond(ctx_starts(ctx, n_gen) if use_start else None, n_gen, device)
         for name, sigmas_, heun, clamp, clip in sampler_variants(args.steps):
             s0 = start_scale(sigmas_[0])
-            zg, pg, run = integrate(model, base_x * s0, base_p * s0, sigmas_, heun=heun, clamp=clamp, clip_x1=clip)
+            zg, pg, run = integrate(model, base_x * s0, base_p * s0, sigmas_, heun=heun, clamp=clamp, clip_x1=clip, start=cond_gen)
+            pg = model._state_to_pos(pg, cond_gen)
             stats = latent_stats(zg, pg)
             sampler_results.append({"name": name, **run, **stats})
             print(f"  {name:52s} | {run['network_evaluations']:5d} | {stats['feat_std']:.3f} | "
@@ -1339,7 +1677,8 @@ def main():
         print("\nDenoising real latents from partial noise (PSNR of the render vs the autoencoder reconstruction):")
         print("  start t (sigma) | latent MSE feat / pos | PSNR")
         for t0 in (0.9, 0.7, 0.5, 0.3, 0.1):
-            zd, pd = denoise_from(model, z_real, p_real, t0, args.steps, seed=args.seed)
+            zd, pd = denoise_from(model, z_real, p_real, t0, args.steps, seed=args.seed,
+                                  start=torch.cat([c["start"] for c in ctx]) if use_start else None)
             mse_f = (zd - z_real).square().mean().item(); mse_p = (pd - p_real).square().mean().item()
             imgs = [model.render(zd[i:i + 1], pd[i:i + 1], ctx[i]["ray_o"], ctx[i]["ray_d"], IMAGE_HW)[0] for i in range(n_render)]
             score = float(np.mean([psnr(imgs[i], ctx[i]["recon"]) for i in range(n_render)]))
