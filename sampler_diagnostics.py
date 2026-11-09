@@ -18,6 +18,9 @@ against real; use --scenes 128), --real-projection (real features projected onto
 --ladder (noise ladder: flow against plain noise of the same size) or --structure --height-split (floor against
 object tokens) or --position-origin (how far the encoder moves each token from the position it starts at, which the
 input cameras fix) to run only that part.
+--token-overlay (tokens in front drawn as dots on 2 rendered views, real against generated, coloured by feature
+direction and by feature agreement with their nearest tokens) and --interpolate (latent blend and noise interpolation between one fixed pair of
+scenes, --pair A B) also run only that part.
 Add --split train to use training scenes.
 For a flow conditioned on the starting positions (diffusion.condition_start) generated scenes get the starting positions
 of the cameras of the real scenes of --split (validation scenes by default: the flow never trained on their cameras;
@@ -95,6 +98,18 @@ def parse_args():
     p.add_argument("--copy-train-scenes", type=int, default=0,
                    help="With --gen-metrics and --split val: also compare generated views with the reconstructions of this many "
                         "TRAINING scenes (copy check). 0 = off.")
+    p.add_argument("--token-overlay", action="store_true",
+                   help="Only draw the latent tokens as dots on rendered views, real scenes against generated ones, coloured by feature "
+                        "agreement with the nearest tokens and by input view (--overlay-scenes scenes; gravity data).")
+    p.add_argument("--overlay-scenes", type=int, default=3, help="With --token-overlay: number of scenes (real and generated each).")
+    p.add_argument("--overlay-radius", type=float, default=5.0, help="With --token-overlay: a token is hidden if a nearer one lies within this many pixels (larger = fewer dots).")
+    p.add_argument("--overlay-views", type=int, nargs="+", default=[0, 3], help="With --token-overlay: which of the 5 views to show (fewer views, bigger panels).")
+    p.add_argument("--interpolate", action="store_true",
+                   help="Only interpolate between one fixed pair of validation scenes (--pair): a latent blend of the real latents and a "
+                        "noise interpolation through the flow, plus pixel cross-fade numbers (gravity data).")
+    p.add_argument("--pair", type=int, nargs=2, default=[0, 1], metavar=("A", "B"),
+                   help="With --interpolate: positions of the two scenes among the validation scenes.")
+    p.add_argument("--interp-steps", type=int, default=5, help="With --interpolate: points along the path (at least 3).")
     p.add_argument("--rigs", type=int, default=4,
                    help="With --position-origin: camera sets per scene (the first is the fixed set 0,3,6,9,12, the rest are "
                         "random 5 of the available views).")
@@ -1435,6 +1450,304 @@ def run_position_origin(model, ae, dataset, device, edict, n_scenes, rigs, seed,
 
 
 
+# ----------------------------------------------------------------------------- token overlay
+def rays_vhw3(ray_o, ray_d, h, w):
+    """Rays of one scene as (origins, unit directions), each [V, H*W, 3], whatever layout compute_rays used
+    ([B, V, 3, H, W] in this code base; channel-last and flattened layouts are accepted too)."""
+    try:
+        o, d = torch.broadcast_tensors(ray_o.float(), ray_d.float())
+    except RuntimeError as e:
+        raise ValueError(f"ray_o {tuple(ray_o.shape)} and ray_d {tuple(ray_d.shape)} cannot be broadcast: {e}")
+
+    def fix(t):
+        if t.dim() >= 3 and tuple(t.shape[-3:-1]) == (h, w) and t.shape[-1] == 3:
+            return t.reshape(-1, h * w, 3)
+        if t.dim() >= 3 and t.shape[-3] == 3 and tuple(t.shape[-2:]) == (h, w):
+            return t.movedim(-3, -1).reshape(-1, h * w, 3)
+        if t.dim() >= 2 and t.shape[-2] == h * w and t.shape[-1] == 3:
+            return t.reshape(-1, h * w, 3)
+        raise ValueError(f"unexpected ray layout {tuple(t.shape)} for an image of {h}x{w}")
+    o, d = fix(o), fix(d)
+    return o, d / d.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+@torch.no_grad()
+def project_tokens(X, o, d, h, w, tol=2.0, chunk=64):
+    """Where do 3D points X [N, 3] (the autoencoder's own position frame) fall in each camera's image?
+
+    Convention free: for every camera the pixel whose ray passes closest to the point (and in front of the camera) is
+    taken, so no intrinsics or pose convention is assumed beyond what compute_rays already uses to render.
+    Returns px, py [V, N] (pixel column and row), visible [V, N] (the point lies within `tol` pixel footprints of
+    that ray, i.e. inside the image), miss [V, N] (distance to the ray in pixel footprints at the point's depth) and
+    depth [V, N] (distance along the ray from the camera)."""
+    V, HW, _ = o.shape
+    X = X.float().to(o.device)
+    N = X.shape[0]
+    dv = d.reshape(V, h, w, 3)
+    ang = (dv[:, :, 1:] - dv[:, :, :-1]).norm(dim=-1).flatten(1).median(dim=1).values.clamp_min(1e-9)   # angle per pixel
+    px = torch.zeros(V, N); py = torch.zeros(V, N); miss = torch.full((V, N), float("inf")); depth = torch.zeros(V, N)
+    for v in range(V):
+        for c in range(0, N, chunk):
+            Xc = X[c:c + chunk]
+            wv = Xc[None] - o[v][:, None]                           # [HW, n, 3]
+            t = (wv * d[v][:, None]).sum(-1)                        # distance along each ray
+            perp2 = ((wv * wv).sum(-1) - t * t).clamp_min(0).masked_fill(t <= 0, float("inf"))
+            best, idx = perp2.min(dim=0)
+            tb = t.gather(0, idx[None])[0].clamp_min(1e-9)
+            px[v, c:c + chunk] = (idx % w).float().cpu(); py[v, c:c + chunk] = (idx // w).float().cpu()
+            miss[v, c:c + chunk] = (best.sqrt() / (ang[v] * tb)).cpu(); depth[v, c:c + chunk] = tb.cpu()
+    return px, py, miss <= tol, miss, depth
+
+
+def front_mask(px, py, vis, depth, radius=5.0):
+    """Heuristic occlusion test, per view: a token is dropped if a NEARER visible token lies within `radius` pixels of
+    it on the image (tokens are points, not surfaces, so this only thins out tokens that sit behind other tokens;
+    it is not a depth buffer). Returns bool [V, N]."""
+    V, N = px.shape
+    keep = torch.zeros(V, N, dtype=torch.bool)
+    for v in range(V):
+        order = [int(i) for i in torch.argsort(depth[v]) if bool(vis[v, i])]
+        kept = []
+        for i in order:
+            if all((px[v, i] - px[v, j]) ** 2 + (py[v, i] - py[v, j]) ** 2 > radius ** 2 for j in kept):
+                kept.append(i)
+        keep[v, kept] = True
+    return keep
+
+
+def to_ae_frame(model, pos):
+    """Flow-space positions back to the autoencoder's frame (the frame the cameras live in)."""
+    n = getattr(model, "normaliser", None)
+    return pos if n is None else pos * n.pos_scale.to(pos.device) + n.pos_mean.to(pos.device).reshape(3)   # pos_mean is [1, 1, 3]; keep the input's shape
+
+
+def neighbour_agreement(z, pos, slot_mean, k=4):
+    """Per token: mean cosine similarity of its slot-centred features with the k tokens nearest to it by position
+    (the number --structure averages). z [1, N, F], pos [1, N, 3], slot_mean [1, N, F] -> [N]."""
+    D = torch.cdist(pos.float(), pos.float())[0]
+    D.fill_diagonal_(float("inf"))
+    idx = D.topk(k, largest=False).indices                           # [N, k]
+    r = z.float() - slot_mean.float()
+    r = (r / r.norm(dim=-1, keepdim=True).clamp_min(1e-8))[0]
+    C = r @ r.T
+    return torch.gather(C, 1, idx).mean(dim=1)
+
+
+def pca_rgb_fit(z_real, slot_mean):
+    """Colour code for features: the top 3 principal directions of the slot-centred REAL features, each scaled to its
+    2nd to 98th percentile on the real tokens. z_real [S, N, F]. Returns a function mapping z [1, N, F] to RGB [N, 3]
+    (real and generated tokens use the same code, so equal colour means equal feature direction)."""
+    r = (z_real.float() - slot_mean.float()).reshape(-1, z_real.shape[-1])
+    mu = r.mean(0, keepdim=True)
+    cov = ((r - mu).T @ (r - mu)) / max(1, r.shape[0] - 1)
+    evals, evecs = torch.linalg.eigh(cov.double())
+    V3 = evecs[:, -3:].flip(-1).float()                                # top 3
+    pr = (r - mu) @ V3
+    lo = torch.quantile(pr, 0.02, dim=0); hi = torch.quantile(pr, 0.98, dim=0)
+    def rgb(z):
+        q = ((z.float().to(r.device) - slot_mean.float().to(r.device)).reshape(-1, z.shape[-1]) - mu) @ V3
+        return ((q - lo) / (hi - lo).clamp_min(1e-6)).clamp(0, 1).cpu()
+    return rgb
+
+
+def projection_selfcheck(model, c, view_size=VIEW_SIZE, n_ray=N_RAY_TOKENS):
+    """A guard against a frame mismatch, not a proof of the projection. The starting positions of the tokens of input
+    view k lie on that camera's rays by construction, so after the same flow-space-to-autoencoder-frame step the overlay
+    uses they must project into view k. If they do not, the positions and the cameras are in different frames (for
+    example a wrong denormalisation) and the dots are meaningless. It cannot detect a swapped pixel axis or a mix-up
+    between cameras that look at the same centre; for those, check by eye that floor tokens sit on the floor.
+    Returns (share inside the own view, median miss in pixel footprints)."""
+    o, d = rays_vhw3(c["ray_o"], c["ray_d"], *IMAGE_HW)
+    X = to_ae_frame(model, c["start"][0])
+    px, py, vis, miss, _ = project_tokens(X, o, d, *IMAGE_HW)
+    V = o.shape[0]
+    ok, vals = [], []
+    for v in range(min(V, n_ray // view_size)):
+        sl = slice(v * view_size, (v + 1) * view_size)
+        ok.append(vis[v, sl].float()); vals.append(miss[v, sl])
+    return float(torch.cat(ok).mean()), float(torch.cat(vals).median())
+
+
+def _scene_overlay_panels(model, c, z, pos, images, slot_mean, rgb_fn, radius=5.0):
+    """Everything the figures need for one scene: pixel positions of the tokens in every view, which of them are in
+    front (heuristic), the per-token agreement with the neighbours and the feature colour of each token."""
+    o, d = rays_vhw3(c["ray_o"], c["ray_d"], *IMAGE_HW)
+    pos3 = pos if pos.dim() == 3 else pos[None]
+    X = to_ae_frame(model, pos3[0])
+    px, py, vis, _, depth = project_tokens(X, o, d, *IMAGE_HW)
+    return {"px": px, "py": py, "vis": vis, "front": front_mask(px, py, vis, depth, radius),
+            "agree": neighbour_agreement(z, pos3, slot_mean).cpu(), "rgb": rgb_fn(z), "images": images.float().clamp(0, 1).cpu()}
+
+
+def plot_overlay(pairs, views, path, colour, titles):
+    """pairs: one (real panel, generated panel) per scene. Layout: one row per scene; for every shown view a real and a
+    generated column next to each other. colour: 'features' (PCA colour code) or 'agree' (agreement with the neighbours)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"  (no figure: {e})")
+        return False
+    R, C = len(pairs), 2 * len(views)
+    fig, axes = plt.subplots(R, C, figsize=(3.6 * C, 3.7 * R), squeeze=False)
+    sc = None
+    for r, pair in enumerate(pairs):
+        for k, v in enumerate(views):
+            for j, (pnl, lab) in enumerate(zip(pair, ("real", "generated"))):
+                ax = axes[r, 2 * k + j]
+                ax.imshow(pnl["images"][v].permute(1, 2, 0).numpy(), interpolation="nearest")
+                m = (pnl["vis"][v] & pnl["front"][v]).numpy().astype(bool)
+                if colour == "features":
+                    ax.scatter(pnl["px"][v][m], pnl["py"][v][m], c=pnl["rgb"][m].numpy(), s=60, edgecolors="white", linewidths=0.8)
+                else:
+                    sc = ax.scatter(pnl["px"][v][m], pnl["py"][v][m], c=pnl["agree"][m].numpy(), s=60, cmap="viridis", vmin=0.0, vmax=0.8,
+                                    edgecolors="white", linewidths=0.8)
+                ax.set_xlim(-0.5, IMAGE_HW[1] - 0.5); ax.set_ylim(IMAGE_HW[0] - 0.5, -0.5)
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.set_title(f"scene {r}, view {v}: {lab} ({int(m.sum())} tokens)", fontsize=8)
+    if colour == "agree" and sc is not None:
+        fig.colorbar(sc, ax=axes, shrink=0.4, pad=0.01, label="mean cosine of the 4 nearest tokens' features")
+    fig.suptitle("Tokens in front, coloured by " + (
+        "feature direction (the same colour code for real and generated; similar colour = similar features)" if colour == "features"
+        else "agreement with the 4 nearest tokens (real scenes: about 0.5)"), fontsize=10)
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+@torch.no_grad()
+def run_token_overlay(model, ctx, z_real, steps, seed, device, out_dir, use_start=True, views=(0, 3), radius=5.0):
+    """Draw the latent tokens on rendered views: real scenes (autoencoder reconstruction) against generated scenes.
+
+    Each dot is a token at the pixel its position projects to. To keep the picture readable only `views` are shown,
+    and tokens that sit behind a nearer token (within `radius` pixels, heuristic) are dropped. Figure 1 colours tokens by
+    the direction of their features (top 3 principal directions of real features as RGB, one code for real and
+    generated): in a real scene neighbouring tokens should share a colour, in a generated scene they speckle. Figure 2
+    colours them by agreement with their 4 nearest tokens (the F13 number, about 0.5 real, 0.16 generated).
+    z_real: real validation latents [S, N, F] (flow space), for the slot mean and the colour code.
+    Generated scene i is rendered with the cameras (and starting positions) of real scene i."""
+    n = len(ctx)
+    slot_mean = z_real.float().mean(dim=0, keepdim=True)
+    rgb_fn = pca_rgb_fit(z_real, slot_mean)
+    sc_share, sc_miss = zip(*[projection_selfcheck(model, c) for c in ctx])
+    print(f"\nToken overlay for {n} scenes, views {list(views)} (real against generated, the same cameras for both).")
+    print(f"  frame guard: the starting positions of the tokens of input view k fall inside view k for {100 * float(np.mean(sc_share)):.1f}% of tokens "
+          f"(expected about 100%: they lie on that camera's rays by construction). It catches positions that are in another frame than the cameras; "
+          f"it cannot catch a swapped pixel axis, so check by eye that the floor tokens sit on the floor and the object tokens on the objects.")
+    if float(np.mean(sc_share)) <= 0.95:
+        print("  WARNING: the frame guard failed, so the token positions and the cameras are not in the same frame. Do not trust the dots.")
+    out = generate_samples(model, n, steps, seed, device, start=ctx_starts(ctx, n) if use_start else None)
+    name, zg, pg = out[0]
+    pairs, summary = [], {"sampler": name, "views": list(views), "front_radius_pixels": radius,
+                          "projection_selfcheck_share": float(np.mean(sc_share)), "projection_selfcheck_median_miss": float(np.median(sc_miss)), "scenes": []}
+    for i, c in enumerate(ctx):
+        gen_img = model.render(zg[i:i + 1], pg[i:i + 1], c["ray_o"], c["ray_d"], IMAGE_HW)[0]
+        real = _scene_overlay_panels(model, c, c["z"], c["pos"], c["recon"], slot_mean, rgb_fn, radius)
+        gen = _scene_overlay_panels(model, c, zg[i:i + 1], pg[i:i + 1], gen_img, slot_mean, rgb_fn, radius)
+        pairs.append((real, gen))
+        shown = lambda p_, v: int((p_["vis"][v] & p_["front"][v]).sum())
+        row = {"scene": i, "real_mean_agreement": float(real["agree"].mean()), "generated_mean_agreement": float(gen["agree"].mean()),
+               "tokens_shown_real": {int(v): shown(real, v) for v in views}, "tokens_shown_generated": {int(v): shown(gen, v) for v in views}}
+        summary["scenes"].append(row)
+        print(f"  scene {i}: mean agreement with the 4 nearest tokens (all tokens) real {row['real_mean_agreement']:.3f}, generated {row['generated_mean_agreement']:.3f}; "
+              f"tokens shown per view: real {row['tokens_shown_real']}, generated {row['tokens_shown_generated']}")
+    titles = None
+    ok1 = plot_overlay(pairs, views, out_dir / "10_token_overlay_features.png", "features", titles)
+    ok2 = plot_overlay(pairs, views, out_dir / "10_token_overlay_agreement.png", "agree", titles)
+    summary["figures"] = bool(ok1 and ok2)
+    (out_dir / "token_overlay.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
+    return summary
+
+
+# ----------------------------------------------------------------------------- interpolation
+def slerp_noise(xa, pa, xb, pb, t):
+    """Spherical interpolation between two Gaussian noise draws (features xa/xb [N, F], positions pa/pb [N, 3], taken as
+    one vector). Keeps the noise norm, which a straight blend would shrink by up to 30% in the middle."""
+    a = torch.cat([xa, pa], dim=-1); b = torch.cat([xb, pb], dim=-1)
+    cos = (a.flatten() @ b.flatten() / (a.norm() * b.norm())).clamp(-1 + 1e-6, 1 - 1e-6)
+    om = torch.acos(cos)
+    m = (torch.sin((1 - t) * om) * a + torch.sin(t * om) * b) / torch.sin(om)
+    return m[..., :xa.shape[-1]], m[..., xa.shape[-1]:]
+
+
+@torch.no_grad()
+def generate_from_noise(model, base_x, base_p, steps, start=None):
+    """The run's own sampler (the first variant of generate_samples) from GIVEN starting noise [n, N, F] and [n, N, 3]."""
+    cond = model.as_cond(start, base_x.shape[0], base_x.device)
+    if getattr(model, "time_coupling", "joint") == "decoupled":
+        return model._integrate_decoupled(base_x, base_p, steps, start=cond)
+    name, sigmas_, heun, clamp, clip = sampler_variants(steps)[0]
+    s0 = start_scale(sigmas_[0])
+    zg, pg, _ = integrate(model, base_x * s0, base_p * s0, sigmas_, heun=heun, clamp=clamp, clip_x1=clip, start=cond)
+    return zg, model._state_to_pos(pg, cond)
+
+
+def path_ratio(images):
+    """images: list of [V, 3, H, W] along an interpolation. Pixel-space length of the path divided by the distance
+    between its ends (L1). A straight path, such as a pixel cross-fade, gives exactly 1; a path that leaves the straight
+    line (a real morph, or objects appearing and vanishing) gives more."""
+    steps = sum(float((images[i + 1] - images[i]).abs().mean()) for i in range(len(images) - 1))
+    end = float((images[-1] - images[0]).abs().mean())
+    return steps / end if end > 1e-9 else float("nan")
+
+
+@torch.no_grad()
+def run_interpolate(model, ctx, a, b, n_steps, steps, seed, device, out_dir, use_start=True, views=(0, 3)):
+    """Interpolate between ONE fixed pair of scenes (positions a and b of the validation split, kept fixed by the seed).
+
+    1. Latent blend of the two REAL latents, token by token (features and positions), rendered with the cameras of
+       scene a. Token i of one scene need not mean the same as token i of the other (each scene has its own cameras, F12),
+       so a blend may be a superposition of the two scenes instead of a morph. Row 3 is the plain pixel cross-fade of the
+       two end renders for comparison: if the blend looks like it, the latent behaves like a superposition.
+    2. Noise interpolation through the flow: two noise draws (fixed seeds) blended spherically, sampled with the starting
+       positions and cameras of scene a. Tests how smoothly the flow turns nearby noises into scenes.
+    The two end renders of 1 are scene a and scene b seen from the cameras of a."""
+    ts = [i / (n_steps - 1) for i in range(n_steps)]
+    A, B = ctx[a], ctx[b]
+    blend = []
+    for t in ts:
+        z = (1 - t) * A["z"] + t * B["z"]; p = (1 - t) * A["pos"] + t * B["pos"]
+        blend.append(model.render(z, p, A["ray_o"], A["ray_d"], IMAGE_HW)[0].float().clamp(0, 1).cpu())
+    fade = [(1 - t) * blend[0] + t * blend[-1] for t in ts]
+    mid = n_steps // 2
+    g = torch.Generator(device=device).manual_seed(seed)
+    xa = torch.randn(model.n_tokens, model.scalar_dim, device=device, generator=g)
+    pa = torch.randn(model.n_tokens, 3, device=device, generator=g)
+    xb = torch.randn(model.n_tokens, model.scalar_dim, device=device, generator=g)
+    pb = torch.randn(model.n_tokens, 3, device=device, generator=g)
+    mixed = [slerp_noise(xa, pa, xb, pb, t) for t in ts]
+    bx = torch.stack([m[0] for m in mixed]); bp = torch.stack([m[1] for m in mixed])
+    start = A["start"].expand(n_steps, -1, -1) if (getattr(model, "cond_start", False) and use_start) else None
+    zg, pg = generate_from_noise(model, bx, bp, steps, start=start)
+    gen = [model.render(zg[i:i + 1], pg[i:i + 1], A["ray_o"], A["ray_d"], IMAGE_HW)[0].float().clamp(0, 1).cpu() for i in range(n_steps)]
+    res = {"pair": [a, b], "interpolation_steps": n_steps, "views_shown": list(views),
+           "blend_path_ratio": path_ratio(blend), "crossfade_path_ratio": path_ratio(fade), "noise_path_ratio": path_ratio(gen),
+           "blend_midpoint_psnr_vs_crossfade": psnr(blend[mid], fade[mid]),
+           "blend_midpoint_psnr_vs_end_a": psnr(blend[mid], blend[0]), "blend_midpoint_psnr_vs_end_b": psnr(blend[mid], blend[-1]),
+           "ends_psnr_a_vs_b": psnr(blend[0], blend[-1]),
+           "noise_midpoint_psnr_vs_end_a": psnr(gen[mid], gen[0]), "noise_midpoint_psnr_vs_end_b": psnr(gen[mid], gen[-1]),
+           "noise_ends_psnr": psnr(gen[0], gen[-1]),
+           "note": "PSNR here compares two images of the same interpolation, not a quality metric. Path ratio 1 = straight in pixel space."}
+    print(f"\nInterpolation between validation scenes {a} and {b} ({n_steps} steps, {len(views)} views saved; scene b is seen from the cameras of scene a).")
+    print(f"  1. Latent blend of the two real latents: end renders differ by {res['ends_psnr_a_vs_b']:.1f} dB PSNR (low = very different scenes).")
+    print(f"     midpoint against the pixel cross-fade of the ends: {res['blend_midpoint_psnr_vs_crossfade']:.1f} dB; against end a {res['blend_midpoint_psnr_vs_end_a']:.1f} dB, against end b {res['blend_midpoint_psnr_vs_end_b']:.1f} dB.")
+    print(f"     pixel path length over end distance: blend {res['blend_path_ratio']:.2f}, cross-fade {res['crossfade_path_ratio']:.2f} (1.00 = straight line). "
+          "A midpoint close to the cross-fade and a ratio near 1 mean the blend is a superposition, not a morph.")
+    print(f"  2. Noise interpolation through the flow: ends differ by {res['noise_ends_psnr']:.1f} dB, midpoint against end a {res['noise_midpoint_psnr_vs_end_a']:.1f} dB and end b {res['noise_midpoint_psnr_vs_end_b']:.1f} dB; "
+          f"path ratio {res['noise_path_ratio']:.2f}. A ratio well above 1 means scenes change abruptly between neighbouring noises.")
+    for v in views:
+        v = min(v, blend[0].shape[0] - 1)
+        rows = [("scene a: autoencoder reconstruction (own cameras)", [A["recon"][v:v + 1].float().clamp(0, 1).cpu()]),
+                ("1. latent blend a to b (cameras of a)", [x[v:v + 1] for x in blend]),
+                ("   pixel cross-fade of the two end renders", [x[v:v + 1] for x in fade]),
+                ("scene b: autoencoder reconstruction (own cameras)", [B["recon"][v:v + 1].float().clamp(0, 1).cpu()]),
+                ("2. generated, noise interpolation (cameras of a)", [x[v:v + 1] for x in gen])]
+        save_grid(out_dir / f"11_interpolation_view{v}.png", rows, label_width=330)
+    (out_dir / "interpolation.json").write_text(json.dumps(res, indent=2, allow_nan=True) + "\n")
+    return res
+
+
 def choose_checkpoint(directory):
     candidates = sorted(Path(directory).glob("*.pt"))   # same ordering as PlatonicAutoencoder.load_ckpt
     if not candidates:
@@ -1511,7 +1824,7 @@ def main():
         raise RuntimeError("--copy-train-scenes belongs to --gen-metrics.")
     if args.copy_train_scenes and args.split != "val":
         raise RuntimeError("--copy-train-scenes compares with training scenes, so the real scenes must come from --split val.")
-    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics or args.real_projection or args.position_origin):
+    if config_coupling == "decoupled" and not (args.structure or args.swap_test or args.pca_test or args.decoder_tolerance or args.gen_metrics or args.real_projection or args.position_origin or args.token_overlay or args.interpolate):
         raise RuntimeError("This checkpoint uses separate times for positions and features. The default mode and --trace "
                            "assume one time for both and are not valid for it; use --structure, --swap-test, "
                            "--pca-test, --decoder-tolerance, --gen-metrics, --real-projection or --position-origin.")
@@ -1583,6 +1896,25 @@ def main():
                 patch_fn = None
             run_position_origin(model, ae, val_set, device, edict, args.val_scenes, max(1, args.rigs), args.seed, out_dir, patch_fn)
             print(f"\nSaved 9_position_origin.png and position_origin.json in {out_dir}")
+            return
+
+        if args.token_overlay:
+            out_dir = args.out_dir.expanduser().resolve() / ("token_overlay_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            ctx = build_scene_context(model, ae, val_set, device, edict, n=max(1, args.overlay_scenes))
+            run_token_overlay(model, ctx, z1, args.steps, args.seed, device, out_dir, use_start=use_start, views=tuple(args.overlay_views), radius=args.overlay_radius)
+            print(f"\nSaved 10_token_overlay_features.png, 10_token_overlay_agreement.png and token_overlay.json in {out_dir}")
+            return
+
+        if args.interpolate:
+            a, b = args.pair
+            if a == b or min(a, b) < 0 or max(a, b) >= len(val_set) or args.interp_steps < 3:
+                raise RuntimeError(f"--pair needs two different scene positions below {len(val_set)} and --interp-steps at least 3.")
+            out_dir = args.out_dir.expanduser().resolve() / ("interpolation_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            out_dir.mkdir(parents=True, exist_ok=False)
+            ctx = build_scene_context(model, ae, val_set, device, edict, n=max(a, b) + 1)
+            run_interpolate(model, ctx, a, b, args.interp_steps, args.steps, args.seed, device, out_dir, use_start=use_start)
+            print(f"\nSaved 11_interpolation_view*.png and interpolation.json in {out_dir}")
             return
 
         if args.real_projection:
