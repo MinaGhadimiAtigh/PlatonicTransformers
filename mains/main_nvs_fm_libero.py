@@ -35,6 +35,10 @@ Key differences from QM9FMModel:
       start_offset_scale  scale of the offset in offset mode (the move has rms about 0.58 per coordinate)
     At generation the starting positions come from camera sets: use those of validation scenes (the flow never trained
     on them), because the starting positions of a training scene's cameras could identify that scene. See StartCond.
+  - libero shards (dataset_name psplat.data.libero_shards.Dataset): optional keys dataset.cache_max_items (items encoded for
+    the copy_ratio caches, 0 = all), dataset.val_stride (validate on every k-th item only, default 1 = all),
+    dataset.norm_max_items (items per normaliser pass, default 0 = the whole training set) and training.limit_train_batches
+    (fixed epoch length). All default to the previous behaviour.
 """
 
 import os
@@ -153,12 +157,17 @@ class LatentStatsAccumulator:
 
 
 @torch.no_grad()
-def fit_normaliser(autoencoder, train_loader, n_passes=1, device="cuda"):
-    print(f"[normaliser] fitting from {n_passes} passes over training set...")
+def fit_normaliser(autoencoder, train_loader, n_passes=1, device="cuda", max_items=0):
+    """max_items > 0: stop each pass after that many items (the loader shuffles, so this is a random subset). The libero
+    shards have about 24k items per pass and read slowly, and per-channel mean and std need far fewer."""
+    import time
+    limit_txt = f" (at most {max_items} items per pass)" if max_items else ""
+    print(f"[normaliser] fitting from {n_passes} passes over training set{limit_txt}...", flush=True)
     acc = LatentStatsAccumulator()
     autoencoder = autoencoder.to(device)
     autoencoder.eval()
     for pass_i in range(n_passes):
+        seen, t0 = 0, time.time()
         for batch in train_loader:
             batch_d = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             input, _ = autoencoder.process_data(
@@ -166,7 +175,11 @@ def fit_normaliser(autoencoder, train_loader, n_passes=1, device="cuda"):
             )
             z_feat, pos_z, _ = autoencoder.encode(input)
             acc.update(pos_z, z_feat)
-        print(f"[normaliser] pass {pass_i+1}/{n_passes} done")
+            seen += z_feat.shape[0]
+            if max_items and seen >= max_items:
+                break
+        dt = time.time() - t0
+        print(f"[normaliser] pass {pass_i+1}/{n_passes} done: {seen} items in {dt:.0f} s ({seen / max(dt, 1e-9):.1f} items/s)", flush=True)
     return acc.finalize()
 
 
@@ -1465,10 +1478,19 @@ def load_data(config: ml_collections.ConfigDict, ae_config: ml_collections.Confi
         num_workers=config.system.num_workers,
         pin_memory=True,
     )
+    # val_stride > 1: validate on every val_stride-th item only (a fixed subset, same every epoch). Lightning validates the
+    # whole loader every epoch; the libero validation split has about 3000 items (the gravity one 64 scenes), which would
+    # cost more reading than the training epoch itself. A stride that does not divide frames_per_episode (16) takes
+    # different frames of every episode. The dataset object stays whole: rendering picks scenes through it.
+    val_stride = int(config.dataset.get("val_stride", 1) or 1)
+    val_sampler = list(range(0, len(val_set), val_stride)) if val_stride > 1 else None
+    if val_sampler is not None:
+        print(f"[data] validation: every {val_stride}th item -> {len(val_sampler)} of {len(val_set)} items", flush=True)
     val_loader = DataLoader(
         val_set,
         batch_size=config.training.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=config.system.num_workers,
         pin_memory=True,
     )
@@ -1510,6 +1532,7 @@ def main(config: ml_collections.ConfigDict) -> None:
                 autoencoder, train_loader,
                 n_passes=norm_passes,
                 device="cuda" if torch.cuda.is_available() else "cpu",
+                max_items=int(config.dataset.get("norm_max_items", 0) or 0),
             )
             if norm_path:
                 save_normaliser(normaliser, norm_path, ae_ckpt_dir)
