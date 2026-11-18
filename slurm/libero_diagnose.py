@@ -5,7 +5,7 @@ Run it through Slurm, never on the login node:
     sbatch /home/mghadim/PlatonicTransformers/slurm/libero_diagnose.sbatch <config> <checkpoint> <label>
 
 It loads a Lightning checkpoint (EMA weights, as validation uses), builds the data like main_nvs_fm_libero.py, and runs
-three parts (--parts, default all three):
+up to four parts (--parts, default learn,rank,gen; add ladder or run it alone with --parts ladder):
 
   learn  Does the flow learn anything? On real validation latents it noises them to fixed noise levels, lets the flow
          denoise them and compares the error with simple reference estimators:
@@ -23,6 +23,13 @@ three parts (--parts, default all three):
          sampler steps. Renders: DINOv2 (or a low-level descriptor) KID of generated views against autoencoder
          reconstructions of real scenes, the real-against-real floor, the autoencoder-against-ground-truth ceiling, and
          multi-view consistency. A picture of ground truth, reconstruction and generated scenes from different tasks.
+
+  ladder Where along the noise range is realness lost? Real validation latents are noised to sigma 0.11, 0.43, 1.0, 2.33 and 9.0
+         (start times t = 0.9, 0.7, 0.5, 0.3, 0.1, the same ladder as the gravity runs), denoised by the flow with the usual Euler
+         sampler from that point on, decoded, and compared with the autoencoder's own decode of the clean latent (PSNR, DINOv2 KID).
+         Four variants: the flow's whole output; the flow's positions with the real features; the real positions with the flow's
+         features; and, as a no-denoising reference, the noisy input as it is. "Real positions + flow features" at low sigma
+         isolates what the low-noise feature floor costs in rendered pictures.
 
 Everything is logged to W&B (project Platonic-NVS-FM-diag: numbers, one table, one picture; no weights, no checkpoints) and
 written to <out-dir>/diagnose.json. --no-wandb turns W&B off.
@@ -46,6 +53,11 @@ import torch.nn.functional as F
 HW = (128, 128)
 SIGMAS = (0.03, 0.1, 0.2, 0.3, 0.6, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0)
 RANKS = (32, 64, 128, 192, 256, 384)
+LADDER_T0 = (0.9, 0.7, 0.5, 0.3, 0.1)       # start times; sigma = (1 - t) / t = 0.11, 0.43, 1.0, 2.33, 9.0
+LADDER_VARIANTS = (("full", "flow output (positions and features)"),
+                   ("flow_pos_real_feat", "flow positions + real features"),
+                   ("real_pos_flow_feat", "real positions + flow features"),
+                   ("noisy_input", "noisy input, not denoised"))
 
 
 class AttrDict(dict):
@@ -64,11 +76,13 @@ def parse_args():
     p.add_argument("--label", type=str, default=None, help="name of this diagnosis (default: run id and checkpoint name)")
     p.add_argument("--fm-script", type=Path, default=Path("mains/main_nvs_fm_libero.py"))
     p.add_argument("--weights", choices=("ema", "online"), default="ema")
-    p.add_argument("--parts", type=str, default="learn,rank,gen", help="comma list of: learn, rank, gen")
+    p.add_argument("--parts", type=str, default="learn,rank,gen", help="comma list of: learn, rank, gen, ladder")
     p.add_argument("--n-real", type=int, default=160, help="real validation scenes (one per episode) for the references")
     p.add_argument("--n-gen", type=int, default=96, help="generated scenes")
     p.add_argument("--steps", type=int, default=200, help="sampler steps of the main generation (training validation uses 50)")
     p.add_argument("--compare-steps", type=int, default=50, help="second generation with this many steps (latent statistics only)")
+    p.add_argument("--n-ladder", type=int, default=48, help="scenes for the noise ladder (spread over the validation episodes)")
+    p.add_argument("--ladder-steps", type=int, default=100, help="Euler steps the ladder would use from noise to data (fewer from a later start)")
     p.add_argument("--draws", type=int, default=3, help="noise draws per noise level in the learning test")
     p.add_argument("--n-rank", type=int, default=16, help="scenes for the rank/render test")
     p.add_argument("--feature-net", choices=("auto", "dinov2", "lowlevel"), default="auto")
@@ -604,6 +618,100 @@ def diverse(labels, k):
     return out[:k]
 
 
+# ----------------------------------------------------------------------------- noise ladder
+@torch.no_grad()
+def ladder_denoise(model, z1, p1, start_all, t0, steps, seed, device, chunk=16):
+    """Noise the real latents to time t0 (sigma = (1 - t0) / t0), then run the sampler's own Euler steps (velocity clamp 10)
+    from t0 to 1. Returns the flow's features and positions, and the noisy input rescaled to the data scale (x_t / t0)."""
+    S = z1.shape[0]
+    cond_all = model.as_cond(start_all, S, device) if model.cond_start else None
+    gen = torch.Generator(device=device).manual_seed(seed)
+    zf, pf, zn, pn = [], [], [], []
+    ts = torch.linspace(t0, 1.0, steps + 1, device=device)
+    for s in range(0, S, chunk):
+        x1, pos1 = z1[s:s + chunk], p1[s:s + chunk]
+        cond = None if cond_all is None else cond_all[s:s + chunk]
+        pst = model._pos_to_state(pos1, cond)
+        B = x1.shape[0]
+        x0 = torch.randn(x1.shape, device=device, generator=gen)
+        p0 = torch.randn(pst.shape, device=device, generator=gen)
+        x, pos = (1 - t0) * x0 + t0 * x1, (1 - t0) * p0 + t0 * pst
+        zn.append((x / t0).float()); pn.append(model._state_to_pos(pos / t0, cond).float())
+        for i in range(steps):
+            dt = ts[i + 1] - ts[i]
+            vx, vp = model._velocity(x, pos, ts[i].expand(B), start=cond)
+            vx, vp = vx.clamp(-10, 10), vp.clamp(-10, 10)
+            x, pos = x + dt * vx, pos + dt * vp
+        zf.append(x.float()); pf.append(model._state_to_pos(pos, cond).float())
+    return torch.cat(zf), torch.cat(pf), torch.cat(zn), torch.cat(pn)
+
+
+@torch.no_grad()
+def ladder_test(model, ctx, steps, seed, device, feature_net, show):
+    """Where along the noise range is realness lost? See the docstring at the top (part ladder). ctx: scenes built by build_ctx.
+    show: positions in ctx of the scenes drawn in the picture. Returns (result dict, picture array or None)."""
+    S = len(ctx)
+    n_views = ctx[0]["recon"].shape[0]
+    z1, p1 = torch.cat([c["z"] for c in ctx]), torch.cat([c["pos"] for c in ctx])
+    start = torch.cat([c["start"] for c in ctx]) if model.cond_start else None
+    recon, gt = torch.cat([c["recon"] for c in ctx]), torch.cat([c["gt"] for c in ctx])
+    fname, deep = load_deep_features(device, feature_net)
+    if fname is None:
+        raw = lowlevel_descriptor(recon)
+        mu, sd_ = raw.mean(0), raw.std(0)
+        sd_ = torch.maximum(sd_, sd_.median().clamp(min=1e-6))
+        fname, deep = "low-level descriptor", (lambda x: ((lowlevel_descriptor(x) - mu) / sd_).clamp(-10, 10))
+    f_recon = extract(deep, recon)
+    half = np.arange(S) % 2
+    idx = lambda m: torch.tensor([i * n_views + v for i in range(S) if m[i] for v in range(n_views)]).long()
+    floor = kid_score(f_recon[idx(half == 0)], f_recon[idx(half == 1)], seed=seed)
+    ceiling = kid_score(extract(deep, gt), f_recon, seed=seed)
+    ae_psnr = float(np.mean([psnr(c["recon"], c["gt"]) for c in ctx]))
+    out = {"feature_net": fname, "n_scenes": S, "views_per_scene": n_views,
+           "kid_x1000_real_vs_real_floor": 1000 * floor[0], "kid_x1000_autoencoder_vs_ground_truth_ceiling": 1000 * ceiling[0],
+           "autoencoder_psnr_vs_ground_truth": ae_psnr, "levels": []}
+    shown = {}
+    for t0 in LADDER_T0:
+        sigma = (1 - t0) / t0
+        n_steps = max(2, int(math.ceil(steps * (1 - t0))))
+        zf, pf, zn, pn = ladder_denoise(model, z1, p1, start, t0, n_steps, seed, device)
+        lev = {"sigma": sigma, "t0": t0, "euler_steps": n_steps,
+               "latent_error_feat_flow": float((zf - z1).square().mean()), "latent_error_pos_flow": float((pf - p1).square().mean()),
+               "latent_error_feat_noisy_input": float((zn - z1).square().mean()), "latent_error_pos_noisy_input": float((pn - p1).square().mean())}
+        variants = {"full": (zf, pf), "flow_pos_real_feat": (z1, pf), "real_pos_flow_feat": (zf, p1), "noisy_input": (zn, pn)}
+        for name, (zz, pp) in variants.items():
+            try:
+                stacks = [model.render(zz[i:i + 1], pp[i:i + 1], ctx[i]["ray_o"], ctx[i]["ray_d"], HW)[0].float().clamp(0, 1) for i in range(S)]
+                p_rec = np.array([psnr(stacks[i], ctx[i]["recon"]) for i in range(S)])
+                p_gt = np.array([psnr(stacks[i], ctx[i]["gt"]) for i in range(S)])
+                kid = kid_score(f_recon, extract(deep, torch.cat(stacks)), seed=seed)
+                lev[name] = {"psnr_vs_ae_reconstruction": {"mean": float(p_rec.mean()), "median": float(np.median(p_rec)), "sd": float(p_rec.std())},
+                             "psnr_vs_ground_truth_mean": float(p_gt.mean()), "kid_x1000_vs_ae_reconstruction": [1000 * kid[0], 1000 * kid[1]]}
+                if name in ("full", "real_pos_flow_feat", "flow_pos_real_feat"):
+                    shown[(name, t0)] = [stacks[i][0].cpu() for i in show]
+            except Exception:
+                lev[name] = {"error": traceback.format_exc()}
+                print(f"[ladder] sigma {sigma:.2f} variant {name} FAILED:\n" + traceback.format_exc())
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        out["levels"].append(lev)
+    pic = None
+    try:
+        blocks = []
+        for name, title in LADDER_VARIANTS[:3]:
+            rows = []
+            for r, i in enumerate(show):
+                row = [ctx[i]["recon"][0].cpu()]
+                for t0 in LADDER_T0:
+                    row.append(shown[(name, t0)][r])
+                rows.append(row)
+            blocks.append((f"{title}. Columns: AE reconstruction, then sigma " + ", ".join(f"{(1 - t) / t:.2f}" for t in LADDER_T0) + " (camera 1)", rows))
+        pic = draw_gallery(blocks, 1 + len(LADDER_T0), [f"scene {i}" for i in show])
+    except Exception:
+        out["picture_error"] = traceback.format_exc()
+    return out, pic
+
+
 # ----------------------------------------------------------------------------- main
 def loss_share(model, rows, p_mean, p_std):
     """Where the training feature loss comes from, by noise level: the weighted feature loss at the measured noise levels
@@ -716,13 +824,18 @@ def main():
                 print("[learn] FAILED:\n" + traceback.format_exc()); R["learn_error"] = traceback.format_exc()
 
         ctx = None
-        if parts & {"rank", "gen"}:
-            n_ctx = args.n_real if "gen" in parts else args.n_rank
-            ctx_idx = idxs[:n_ctx] if "gen" not in parts else idxs
+        if parts & {"rank", "gen", "ladder"}:
+            if "gen" in parts:
+                ctx_sel = list(range(len(idxs)))
+            else:                                   # fewer scenes: spread them over the validation episodes
+                n_ctx = max(args.n_rank if "rank" in parts else 0, args.n_ladder if "ladder" in parts else 0)
+                ctx_sel = sorted({int(i) for i in np.linspace(0, len(idxs) - 1, min(n_ctx, len(idxs))).round()})
+            ctx_idx = [idxs[i] for i in ctx_sel]
+            ctx_labels = [labels[i] for i in ctx_sel]
             ctx = build_ctx(fm, model, val_set, ctx_idx, device)
             ps_ = [psnr(c["recon"], c["gt"]) for c in ctx]
             by_suite = {}
-            for c, l, v in zip(ctx, labels, ps_):
+            for c, l, v in zip(ctx, ctx_labels, ps_):
                 by_suite.setdefault(suite_of(l), []).append(v)
             R["autoencoder_psnr_vs_ground_truth"] = {"mean": float(np.mean(ps_)), "by_suite": {k: float(np.mean(v)) for k, v in by_suite.items()}}
             print(f"\nAutoencoder reconstruction against ground truth ({len(ctx)} scenes, all {ctx[0]['recon'].shape[0]} cameras): {np.mean(ps_):.2f} dB; "
@@ -807,6 +920,55 @@ def main():
                     wb.log({"gen/gallery": wandb.Image(gal, caption=f"{label}: ground truth, reconstruction, generated (scene {', '.join(labels[i][:18] for i in show)})")})
             except Exception:
                 print("[gen] FAILED:\n" + traceback.format_exc()); R["gen_error"] = traceback.format_exc()
+
+        # ------------------------------------------------------------------ ladder
+        if "ladder" in parts:
+            try:
+                lad_sel = sorted({int(i) for i in np.linspace(0, len(ctx) - 1, min(args.n_ladder, len(ctx))).round()})
+                lctx = [ctx[i] for i in lad_sel]
+                llabels = [ctx_labels[i] for i in lad_sel]
+                show = list(dict.fromkeys(int(i) for i in np.linspace(0, len(lctx) - 1, min(4, len(lctx))).round()))
+                lad, pic = ladder_test(model, lctx, args.ladder_steps, args.seed, device, args.feature_net, show)
+                lad["scene_names"] = llabels
+                R["ladder"] = lad
+                print(f"\n=== LADDER: real validation latents noised to sigma, denoised by the flow, decoded ({lad['n_scenes']} scenes x {lad['views_per_scene']} cameras; {lad['feature_net']}) ===")
+                print(f"Reference: autoencoder against ground truth {lad['autoencoder_psnr_vs_ground_truth']:.2f} dB; KID x1000 real-vs-real floor {lad['kid_x1000_real_vs_real_floor']:.1f}, "
+                      f"autoencoder-vs-ground-truth ceiling {lad['kid_x1000_autoencoder_vs_ground_truth_ceiling']:.1f}.")
+                print("PSNR (dB) of the decode against the autoencoder's decode of the CLEAN latent, mean over scenes (higher is better):")
+                print(f"{'sigma':>6} {'steps':>5} | " + " ".join(f"{n:>22}" for n, _ in LADDER_VARIANTS))
+                for lv in lad["levels"]:
+                    print(f"{lv['sigma']:6.2f} {lv['euler_steps']:5d} | " + " ".join(
+                        f"{lv[n]['psnr_vs_ae_reconstruction']['mean']:22.2f}" if "psnr_vs_ae_reconstruction" in lv[n] else f"{'failed':>22}" for n, _ in LADDER_VARIANTS))
+                print("KID x1000 of the decoded views against the autoencoder's decode of the clean latents (lower is better):")
+                print(f"{'sigma':>6} | " + " ".join(f"{n:>22}" for n, _ in LADDER_VARIANTS))
+                for lv in lad["levels"]:
+                    print(f"{lv['sigma']:6.2f} | " + " ".join(
+                        f"{lv[n]['kid_x1000_vs_ae_reconstruction'][0]:22.1f}" if "kid_x1000_vs_ae_reconstruction" in lv[n] else f"{'failed':>22}" for n, _ in LADDER_VARIANTS))
+                print("Latent error per coordinate (flow space), flow output against the noisy input: ")
+                for lv in lad["levels"]:
+                    print(f"  sigma {lv['sigma']:5.2f}: features {lv['latent_error_feat_flow']:.4f} (noisy input {lv['latent_error_feat_noisy_input']:.4f}); "
+                          f"positions {lv['latent_error_pos_flow']:.4f} (noisy input {lv['latent_error_pos_noisy_input']:.4f})")
+                for lv in lad["levels"]:
+                    for n, _ in LADDER_VARIANTS:
+                        if "psnr_vs_ae_reconstruction" in lv[n]:
+                            summary[f"ladder/sigma{lv['sigma']:.2f}/{n}/psnr_vs_recon"] = lv[n]["psnr_vs_ae_reconstruction"]["mean"]
+                            summary[f"ladder/sigma{lv['sigma']:.2f}/{n}/kid_vs_recon"] = lv[n]["kid_x1000_vs_ae_reconstruction"][0]
+                summary["ladder/kid_floor"] = lad["kid_x1000_real_vs_real_floor"]
+                summary["ladder/kid_ae_ceiling"] = lad["kid_x1000_autoencoder_vs_ground_truth_ceiling"]
+                if pic is not None:
+                    from PIL import Image
+                    Image.fromarray(pic).save(out_dir / "ladder.png")
+                    if wb is not None:
+                        import wandb
+                        wb.log({"ladder/picture": wandb.Image(pic, caption=f"{label}: rows = scenes; blocks = flow output, real positions + flow features, flow positions + real features")})
+                if wb is not None:
+                    import wandb
+                    cols = ["sigma"] + [f"{n}_{m}" for n, _ in LADDER_VARIANTS for m in ("psnr", "kid_x1000")]
+                    data = [[lv["sigma"]] + [lv[n].get("psnr_vs_ae_reconstruction", {}).get("mean") if m == "psnr" else (lv[n].get("kid_x1000_vs_ae_reconstruction") or [None])[0]
+                                              for n, _ in LADDER_VARIANTS for m in ("psnr", "kid_x1000")] for lv in lad["levels"]]
+                    wb.log({"ladder/table": wandb.Table(columns=cols, data=data)})
+            except Exception:
+                print("[ladder] FAILED:\n" + traceback.format_exc()); R["ladder_error"] = traceback.format_exc()
 
     # ---------------------------------------------------------------------- reading guide
     guide = []
